@@ -5,8 +5,23 @@ from torch.nn import functional as F
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
+from contextlib import contextmanager
 
 from utils import init_whole_model_weights, EBTModelArgs
+
+@contextmanager
+def sdpa_mode_for_ebt(requires_second_order=False):
+    """
+    根据 EBT 的不同阶段动态切换 SDPA 模式
+    """
+    if requires_second_order:
+        # 训练中涉及 MCMC ，必须用 Math
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+            yield
+    else:
+        # 推理阶段，或纯一阶前向阶段
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+            yield
 
 
 class BackwardRMSNormFunction(torch.autograd.Function):
@@ -402,6 +417,7 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        requires_second_order: bool = False,
     ):
         """
         Forward pass of the attention module.
@@ -451,7 +467,8 @@ class Attention(nn.Module):
         # o_mask is [original_seqlen, original_seqlen]; SDPA fuses softmax+matmul
         # and avoids materialising the score matrix in HBM (FlashAttention backend).
         o_mask = mask[:-1, :-1] if mask is not None else None
-        output_o = F.scaled_dot_product_attention(xq_o, keys_o, values_o, attn_mask=o_mask)
+        with sdpa_mode_for_ebt(requires_second_order):
+            output_o = F.scaled_dot_product_attention(xq_o, keys_o, values_o, attn_mask=o_mask)
         output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1)
 
         #pred sequence attn calc is for energy-based transformer ########################################################################################
@@ -495,7 +512,8 @@ class Attention(nn.Module):
 
         mask_p = torch.cat([orig_mask_part, self_mask_part], dim=1)  # [pred_seqlen, 2K-1]
 
-        output_p = F.scaled_dot_product_attention(xq_p, keys_all, values_all, attn_mask=mask_p)
+        with sdpa_mode_for_ebt(requires_second_order):
+            output_p = F.scaled_dot_product_attention(xq_p, keys_all, values_all, attn_mask=mask_p)
         output_p = output_p.transpose(1, 2).contiguous().view(bsz, original_seqlen-1, -1)
         
         #return linear projection of concatted outputs ########################################################################################
@@ -624,6 +642,7 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        requires_second_order: bool = False,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -640,7 +659,7 @@ class TransformerBlock(nn.Module):
         """
         # x has shape B, 2*(S-1), D?
         h = x + self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask
+            self.attention_norm(x), start_pos, freqs_cis, mask, requires_second_order
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -693,7 +712,7 @@ class EBTTimeConcat(nn.Module):
         self.final_layer = nn.Linear(params.dim, 1, bias = False)
         init_whole_model_weights(self.final_layer, self.params.weight_initialization)
 
-    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0):
+    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0, requires_second_order = False):
         """
         Perform a forward pass through the Transformer model.
 
@@ -748,7 +767,7 @@ class EBTTimeConcat(nn.Module):
 
 
             for i, layer in enumerate(self.layers):
-                embeddings = layer(embeddings, start_pos, freqs_cis, mask)
+                embeddings = layer(embeddings, start_pos, freqs_cis, mask, requires_second_order)
             embeddings = self.norm(embeddings)
             embeddings = embeddings[:, 1:] # remove temporal embed
             energies = self.final_layer(embeddings)

@@ -98,7 +98,12 @@ class EBT_NLP(LightningModule):
         
         all_embeddings = torch.cat((real_embeddings_input.detach(), predicted_embeddings), dim = 1) # B, 2*S, D
         
-        energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+        requires_second_order = learning if not self.hparams.truncate_mcmc else (learning and i == (num_mcmc_steps - 1))
+        kwargs = {}
+        if self.hparams.ebt_type == "time_embed":
+            kwargs["requires_second_order"] = requires_second_order
+
+        energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step, **kwargs) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
         energy_preds = energy_preds.reshape(-1, 1)
         
         if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
@@ -328,7 +333,11 @@ class EBT_NLP(LightningModule):
 
         all_true_embeddings = torch.cat((real_embeddings_input, true_embeddings), dim=1)
         
-        real_energies = self.transformer(all_true_embeddings, start_pos=0, mcmc_step=self.hparams.mcmc_num_steps - 1) # NOTE if want to use this maybe check in better detail what ired does
+        kwargs = {}
+        if self.hparams.ebt_type == "time_embed":
+            kwargs["requires_second_order"] = False
+
+        real_energies = self.transformer(all_true_embeddings, start_pos=0, mcmc_step=self.hparams.mcmc_num_steps - 1, **kwargs) # NOTE if want to use this maybe check in better detail what ired does
         real_energies = real_energies.reshape(-1, 1) # BS, 1
         fake_energies = predicted_energies[-1] # B*S, 1
         energy_stack = torch.cat([real_energies, fake_energies], dim=1)
@@ -499,7 +508,12 @@ class EBT_NLP(LightningModule):
                     pred_embeds = self.vocab_to_embed(cur_pred_tokens)
 
                 combined_embeddings = torch.cat([real_embeds, pred_embeds], dim=1)  # (chunk_size, 2S, D)
-                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx)
+                
+                kwargs = {}
+                if self.hparams.ebt_type == "time_embed":
+                    kwargs["requires_second_order"] = learning
+
+                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx, **kwargs)
                 energies = energies.reshape(-1)
                 energies_list.append(energies.detach())
 
@@ -539,7 +553,12 @@ class EBT_NLP(LightningModule):
                 else:
                     pred_embeds = self.vocab_to_embed(cur_pred_tokens)
                 combined_embeddings = torch.cat([real_embeds, pred_embeds], dim=1)  # (chunk_size, 2S, D)
-                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx)
+                
+                kwargs = {}
+                if self.hparams.ebt_type == "time_embed":
+                    kwargs["requires_second_order"] = False
+
+                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx, **kwargs)
                 energies = energies.reshape(-1)
                 return energies
 
