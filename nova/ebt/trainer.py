@@ -238,6 +238,15 @@ class ModelTrainer(LightningModule):
             # else:
             #     raise ValueError(f"do not recognize model name: {self.hparams.model_name}")
 
+        # gradient checkpointing 支持
+        if getattr(self.hparams, 'gradient_checkpointing', False):
+            if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'layers'):
+                for layer in self.model.transformer.layers:
+                    layer.use_gradient_checkpointing = True
+                print(f"[Gradient Checkpointing] 已启用，共 {len(self.model.transformer.layers)} 个 transformer block")
+            else:
+                print("[Gradient Checkpointing] 警告: 未找到 transformer.layers，跳过")
+
         # torch.compile 支持
         # 注意: EBT 使用 autograd.grad 进行 MCMC 更新，与 fullgraph=True 可能不兼容
         # 推荐使用 --compile_model --compile_mode transformer_only 仅编译 transformer 部分
@@ -1099,14 +1108,48 @@ class ModelTrainer(LightningModule):
         # --- 创建优化器 ---
         # PL 调用 optimizer.step(closure=closure), 但 MuonAdamW.step() 不接受 closure 参数
         # 包装一下使其兼容 PL 的调用约定
-        class PLMuonAdamW(MuonAdamW):
-            """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
-            @torch.no_grad()
-            def step(self, closure=None):
-                if closure is not None:
-                    with torch.enable_grad():
-                        closure()
-                super().step()
+        use_cpu_offload = getattr(self.hparams, 'cpu_offload_optimizer', False)
+
+        if use_cpu_offload:
+            class PLMuonAdamW(MuonAdamW):
+                """MuonAdamW + CPU offload: AdamW 优化器状态（m/v）存放在 CPU，step 时临时搬到 GPU。"""
+                @torch.no_grad()
+                def step(self, closure=None):
+                    if closure is not None:
+                        with torch.enable_grad():
+                            closure()
+                    # 将 AdamW state 搬到 GPU
+                    for group in self.param_groups:
+                        if group.get('kind') != 'adamw':
+                            continue
+                        for p in group['params']:
+                            if p.grad is None:
+                                continue
+                            state = self.state[p]
+                            for k, v in state.items():
+                                if isinstance(v, torch.Tensor) and v.device.type == 'cpu':
+                                    state[k] = v.to(p.device, non_blocking=True)
+                    super().step()
+                    # 将 AdamW state 搬回 CPU
+                    for group in self.param_groups:
+                        if group.get('kind') != 'adamw':
+                            continue
+                        for p in group['params']:
+                            state = self.state[p]
+                            for k, v in state.items():
+                                if isinstance(v, torch.Tensor) and v.device.type != 'cpu':
+                                    state[k] = v.to('cpu', non_blocking=True)
+            print("[CPU Offload Optimizer] 已启用: AdamW 优化器状态将存放在 CPU")
+            print("[CPU Offload Optimizer] 注意: PCIe 连接机器可能导致训练速度下降 10-30%")
+        else:
+            class PLMuonAdamW(MuonAdamW):
+                """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
+                @torch.no_grad()
+                def step(self, closure=None):
+                    if closure is not None:
+                        with torch.enable_grad():
+                            closure()
+                    super().step()
 
         optimizer = PLMuonAdamW(param_groups)
 

@@ -664,11 +664,21 @@ class TransformerBlock(nn.Module):
 
         """
         # x has shape B, 2*(S-1), D?
-        h = x + self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask
-        )
-        out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        if getattr(self, 'use_gradient_checkpointing', False) and self.training:
+            # 用 checkpoint 包裹 attention + ffn，不包裹 MCMC 相关逻辑
+            # 注意: MCMC 循环使用 create_graph=True，不能在其内部使用 checkpoint
+            # use_reentrant=False 是 PyTorch 推荐的新 API，与 autograd.grad 兼容性更好
+            def _forward(x):
+                h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+                out = h + self.feed_forward(self.ffn_norm(h))
+                return out
+            return torch.utils.checkpoint.checkpoint(_forward, x, use_reentrant=False)
+        else:
+            h = x + self.attention(
+                self.attention_norm(x), start_pos, freqs_cis, mask
+            )
+            out = h + self.feed_forward(self.ffn_norm(h))
+            return out
 
 
 class EBTTimeConcat(nn.Module):

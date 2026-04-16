@@ -850,6 +850,14 @@ if __name__ == '__main__':
 
     # SPEED ##################################################################
 
+    parser.add_argument("--gradient_checkpointing",
+        help="启用 gradient checkpointing 减少激活值显存，以算力换内存（仅作用于 transformer block，不影响 MCMC 循环）",
+        action="store_true", default=False)
+
+    parser.add_argument("--cpu_offload_optimizer",
+        help="将 AdamW 优化器状态（m/v）存放在 CPU，每步 step 时搬到 GPU 计算，可节省约 3-4 GB 显存（会增加 CPU↔GPU 传输开销）",
+        action="store_true", default=False)
+
     parser.add_argument("--compile_model", help="compiles the model using torch.compile", action="store_true", default=False)
     parser.add_argument("--compile_mode", help="torch.compile 模式: full (编译整个模型), transformer_only (仅编译 transformer，推荐), disabled", type=str, default="transformer_only", choices=["full", "transformer_only", "disabled"])
     parser.add_argument("--compile_backend", help="torch.compile 后端: inductor (默认), eager, aot_eager", type=str, default="inductor")
