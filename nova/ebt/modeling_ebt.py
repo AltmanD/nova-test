@@ -97,8 +97,18 @@ class EBT_NLP(LightningModule):
             predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
         
         all_embeddings = torch.cat((real_embeddings_input.detach(), predicted_embeddings), dim = 1) # B, 2*S, D
-        
-        energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+
+        # 判断本次前向是否需要 create_graph=True（即最后一步且处于训练阶段）。
+        # 当 use_create_graph=True 时，transformer 内部会禁用 Gradient Checkpointing：
+        #   - 不用 GC：保存一份激活值（正常）
+        #   - 用 GC + create_graph=True：backward 重计算时激活值无法释放，等于两份（更差）
+        # 当 use_create_graph=False 时（非最后步或推理），GC 可以正常节省 O(L·A_layer) 显存。
+        if self.hparams.truncate_mcmc:
+            use_create_graph = (i == (num_mcmc_steps - 1)) and learning
+        else:
+            use_create_graph = learning
+
+        energy_preds = self.transformer(all_embeddings, start_pos=start_pos, mcmc_step=mcmc_step, use_create_graph=use_create_graph) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
         energy_preds = energy_preds.reshape(-1, 1)
         
         if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)

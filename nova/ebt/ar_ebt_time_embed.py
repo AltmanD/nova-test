@@ -649,6 +649,7 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        use_create_graph: bool = False,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -658,16 +659,23 @@ class TransformerBlock(nn.Module):
             start_pos (int): Starting position for attention caching.
             freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
             mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
+            use_create_graph (bool): 是否处于 create_graph=True 的 MCMC 步骤中。
+                当为 True 时禁用 Gradient Checkpointing，避免双倍激活值显存占用。
+                原因：create_graph=True 要求保留重计算图的中间激活值，
+                GC 的重计算不仅不能节省显存，反而会额外保存一份激活值。
 
         Returns:
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
         # x has shape B, 2*(S-1), D?
-        if getattr(self, 'use_gradient_checkpointing', False) and self.training:
-            # 用 checkpoint 包裹 attention + ffn，不包裹 MCMC 相关逻辑
-            # 注意: MCMC 循环使用 create_graph=True，不能在其内部使用 checkpoint
-            # use_reentrant=False 是 PyTorch 推荐的新 API，与 autograd.grad 兼容性更好
+        # GC 启用条件：
+        #   1. 用户配置了 use_gradient_checkpointing
+        #   2. 当前处于训练模式
+        #   3. 不处于 create_graph=True 的步骤（否则 GC 适得其反，会保存两份激活值）
+        if getattr(self, 'use_gradient_checkpointing', False) and self.training and not use_create_graph:
+            # use_reentrant=False：PyTorch 推荐的新式 API，与 autograd.grad 兼容性更好，
+            # 且在 create_graph=False 的普通 MCMC 步骤中可以安全节省激活值显存。
             def _forward(x):
                 h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
                 out = h + self.feed_forward(self.ffn_norm(h))
@@ -728,13 +736,19 @@ class EBTTimeConcat(nn.Module):
         self.final_layer = nn.Linear(params.dim, 1, bias = False)
         init_whole_model_weights(self.final_layer, self.params.weight_initialization)
 
-    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0):
+    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0, use_create_graph: bool = False):
         """
         Perform a forward pass through the Transformer model.
 
         Args:
             embeds (torch.Tensor): Embeddings (instead of tokens since is for vision).
             start_pos (int): Starting position for attention caching.
+            mcmc_step (int): Current MCMC step index, used for time embeddings.
+            use_create_graph (bool): 是否处于需要 create_graph=True 的 MCMC 最后一步。
+                该参数会透传给每个 TransformerBlock，用于决定是否启用 Gradient Checkpointing。
+                - False（默认）：非最后一步或推理阶段，GC 可以正常节省显存
+                - True：最后一步且 learning=True，禁用 GC 以避免双倍激活值开销
+                  （create_graph=True 要求保留重计算图，GC 重计算反而增加显存）
 
         Returns:
             torch.Tensor: Output energies after applying the Transformer model.
@@ -783,7 +797,10 @@ class EBTTimeConcat(nn.Module):
 
 
             for i, layer in enumerate(self.layers):
-                embeddings = layer(embeddings, start_pos, freqs_cis, mask)
+                # 将 use_create_graph 透传给每个 TransformerBlock：
+                # - create_graph=False 的普通步骤：GC 可节省 O(L·A_layer) 激活显存
+                # - create_graph=True 的最后步骤：禁用 GC，避免重计算产生两份激活值
+                embeddings = layer(embeddings, start_pos, freqs_cis, mask, use_create_graph)
             embeddings = self.norm(embeddings)
             embeddings = embeddings[:, 1:] # remove temporal embed
             energies = self.final_layer(embeddings)
