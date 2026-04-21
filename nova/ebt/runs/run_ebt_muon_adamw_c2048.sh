@@ -27,24 +27,20 @@
 
 ### 基础配置 ###
 # 用户只需改这一行 —— 描述本次实验的意图/标签
-RUN_PREFIX="bf16mixed-nomcmctime"
+RUN_PREFIX="ebt-d26-ctx2048-0421"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
-# export MODEL_SIZE="medium"
-
-
 
 ### 环境变量 ###
-HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
+HOME="/mnt/shared-storage-user/luyudong/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
 # PyTorch 内存优化
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-
+export PYTORCH_ALLOC_CONF="expandable_segments:True"
 
 # WandB 配置
-export WANDB_API_KEY="Your WandB API Key"
+export WANDB_API_KEY="968275bc822c87ac741ecce2f06cdfb54dbc1608"
 export WANDB_MODE="offline"
 
 mkdir -p logs/slurm/nlp/
@@ -255,7 +251,7 @@ OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio
 # COMPILE_FLAGS="--compile_model --compile_mode disabled" 
 # 启用 compile，steps 较多时适用
 # full mode causes repeated recompilation with create_graph=True + bf16-mixed
-COMPILE_FLAGS="--compile_model --compile_mode full"
+COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
 # COMPILE_FLAGS="--compile_model --compile_mode disabled"
 
 ################################################################################
@@ -495,7 +491,7 @@ print_header "开始训练"
 echo ""
 
 set +e
-torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/luyudong/nova/nova/ebt/train.py \
 --run_name ${RUN_NAME} \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \
@@ -540,7 +536,7 @@ $([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \
 --set_matmul_precision "medium" \
---float_precision "bf16-mixed" \
+--float_precision "bf16-true" \
 --manual_gc_collect_every_n_steps -1 \
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --save_periodic_steps 1000 \
