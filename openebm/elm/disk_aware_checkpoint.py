@@ -6,14 +6,16 @@ import os
 import shutil
 from pathlib import Path
 from lightning.pytorch.callbacks import ModelCheckpoint
+from openebm.elm.perf_monitor import PerfMonitor
 
 
 class DiskAwareCheckpoint(ModelCheckpoint):
     """带磁盘空间检测的 ModelCheckpoint"""
 
-    def __init__(self, *args, min_free_gb=50, **kwargs):
+    def __init__(self, *args, min_free_gb=50, perf_monitor=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.min_free_gb = min_free_gb
+        self.perf_monitor = perf_monitor  # 性能监控器实例
 
     def _check_disk_space(self):
         """检查磁盘剩余空间（GB）"""
@@ -47,6 +49,11 @@ class DiskAwareCheckpoint(ModelCheckpoint):
 
     def _save_checkpoint(self, trainer, filepath):
         """保存前检查磁盘空间"""
+        # 性能监控：记录 checkpoint 开始
+        if self.perf_monitor is not None:
+            global_step = getattr(trainer.model, 'global_step', None)
+            self.perf_monitor.log_event_start('checkpoint', global_step=global_step)
+
         free_gb = self._check_disk_space()
 
         if free_gb < self.min_free_gb:
@@ -59,7 +66,13 @@ class DiskAwareCheckpoint(ModelCheckpoint):
             print(f"[DiskAware] 清理后剩余空间: {free_gb:.1f}GB")
 
         # 调用父类保存方法
-        super()._save_checkpoint(trainer, filepath)
+        try:
+            super()._save_checkpoint(trainer, filepath)
+        finally:
+            # 性能监控：记录 checkpoint 结束
+            if self.perf_monitor is not None:
+                global_step = getattr(trainer.model, 'global_step', None)
+                self.perf_monitor.log_event_end('checkpoint', global_step=global_step)
 
     def _temporarily_align_completed_for_save(self, trainer):
         """让 checkpoint 看到 completed 已更新后的边界，避免 resume 错一批。"""

@@ -26,4 +26,4 @@ rjob submit \
   --custom-resources brainpp.cn/fuse=1 \
   --custom-resources rdma/mlnx_shared=8 \
   --custom-resources mellanox.com/mlnx_rdma=1 \
-  -- bash -exc "/mnt/shared-storage-user/luyudong/nova/nova/ebt/runs/rjob/run_ebt_2node_8gpu.sh"
+  -- bash -exc "/mnt/shared-storage-user/luyudong/nova/openebm/elm/runs/rjob/run_ebt_2node_8gpu.sh"

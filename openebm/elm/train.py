@@ -210,7 +210,21 @@ def main(args):
     ckpt_dir = args.checkpoint_dir if args.checkpoint_dir else f"./logs/checkpoints/{args.run_name}"
     checkpoint_filename = f"s={{step}}-{args.model_size}-ctx{args.context_length}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
     save_last = (args.save_periodic_steps <= 0)  # periodic 启用时不需要 last.ckpt，periodic 已覆盖 crash recovery
-    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = save_last, dirpath=ckpt_dir, filename=checkpoint_filename, verbose=True, min_free_gb=50)
+
+    # 获取性能监控器实例（如果启用）
+    perf_monitor = model_trainer.perf_monitor if getattr(model_trainer, 'perf_monitor', None) is not None else None
+
+    checkpoint_callback = DiskAwareCheckpoint(
+        monitor=args.checkpoint_monitor_string,
+        mode=args.checkpoint_monitor_mode,
+        save_top_k=args.save_top_k_ckpts,
+        save_last=save_last,
+        dirpath=ckpt_dir,
+        filename=checkpoint_filename,
+        verbose=True,
+        min_free_gb=50,
+        perf_monitor=perf_monitor
+    )
 
     # 定期保存 checkpoint（不依赖 val_loss），防止 SFT 后期模型丢失
     periodic_checkpoint = None
@@ -222,7 +236,8 @@ def main(args):
             dirpath=ckpt_dir,
             filename=f"periodic-s={{step}}-{args.model_size}-ctx{args.context_length}",
             verbose=True,
-            min_free_gb=50
+            min_free_gb=50,
+            perf_monitor=perf_monitor
         )
 
     for name, param in model_trainer.model.named_parameters():
@@ -898,6 +913,13 @@ if __name__ == '__main__':
     parser.add_argument("--debug_unused_parameters", help="makes it so it tracks which params are used to find the params that are causing the unused params issue. need to do some things in base_model_trainer so ctrl f this hparam to see the NOTEs", action="store_true", default=False)
 
     parser.add_argument("--manual_gc_collect_every_n_steps", help="manually call gc collect every n steps, can be done to prevent CPU RAM memory 'leak'", type = int, default=-1)
+
+    # 性能监控参数（根据 fix.md 监控方案）
+    parser.add_argument("--enable_perf_monitor", help="enable performance monitoring (rolling throughput, CUDA allocator stats, event markers)", type=bool, default=False)
+    parser.add_argument("--perf_window_size", help="rolling window size for performance metrics (optimizer steps)", type=int, default=50)
+    parser.add_argument("--perf_ema_alpha", help="EMA alpha for tokens/sec smoothing", type=float, default=0.05)
+    parser.add_argument("--perf_log_interval", help="log performance metrics every N optimizer steps", type=int, default=10)
+    parser.add_argument("--perf_cuda_mem_interval", help="log CUDA memory stats every N optimizer steps", type=int, default=50)
 
     parser.add_argument("--debug_videos", help="debug generated videos in a grid", action="store_true", default=False)
 

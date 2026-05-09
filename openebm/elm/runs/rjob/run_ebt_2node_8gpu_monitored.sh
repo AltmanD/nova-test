@@ -1,12 +1,16 @@
 #!/bin/bash
 
 ################################################################################
-# EBT d26 训练脚本 - 2节点 × 8卡
+# EBT d26 训练脚本 - 2节点 × 8卡 - 带性能监控
 #
 # 用法:
-#   通过 rjob 提交 (见配套的 rjob_ebt_2node_8gpu.sh)
-#   本地调试: NODE_RANK=0 NODE_COUNT=1 MASTER_ADDR=127.0.0.1 PROC_PER_NODE=8 bash run_ebt_2node_8gpu.sh
+#   通过 rjob 提交 (见配套的 rjob_ebt_2node_8gpu_monitored.sh)
+#   本地调试: NODE_RANK=0 NODE_COUNT=1 MASTER_ADDR=127.0.0.1 PROC_PER_NODE=8 bash run_ebt_2node_8gpu_monitored.sh
 #
+# 监控功能（根据 fix.md 监控方案）:
+#   - 外部 GPU 监控: nvidia-smi 1秒采样
+#   - CPU/I/O 监控: pidstat/iostat 1秒采样（如果集群允许）
+#   - 训练侧监控: rolling throughput, CUDA allocator stats, event markers
 ################################################################################
 
 # Conda 环境激活（仅远程集群需要，本地调试可跳过）
@@ -30,7 +34,7 @@ cd "${NOVA_HOME}"
 export PYTHONPATH="${NOVA_HOME}:${PYTHONPATH}"
 
 ### 基础配置 ###
-RUN_PREFIX="2node-8gpu-bf16mixed"
+RUN_PREFIX="2node-8gpu-bf16mixed-monitored"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
@@ -175,6 +179,12 @@ if [[ "${USE_SDPA_ATTENTION}" == "true" ]]; then
 fi
 
 ################################################################################
+# 性能监控配置
+################################################################################
+
+PERF_MONITOR_FLAGS="--enable_perf_monitor True --perf_window_size 50 --perf_ema_alpha 0.05 --perf_log_interval 10 --perf_cuda_mem_interval 50"
+
+################################################################################
 # WandB 训练标志
 ################################################################################
 
@@ -195,12 +205,50 @@ mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/${RUN_NAME}_rank${NODE_RANK}.log"
 
 ################################################################################
+# 外部监控启动
+################################################################################
+
+echo "=== 启动外部监控 ==="
+
+# GPU 监控：nvidia-smi 1秒采样
+GPU_MON_FILE="${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_nvidia_smi.csv"
+nvidia-smi \
+  --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.free,power.draw,clocks.sm,temperature.gpu,pstate \
+  --format=csv \
+  -l 1 \
+  -f "${GPU_MON_FILE}" &
+GPU_MON_PID=$!
+echo "GPU 监控已启动 (PID: ${GPU_MON_PID}), 输出到: ${GPU_MON_FILE}"
+
+# CPU/I/O 监控（如果集群允许）
+# pidstat -durh 1 > "${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_pidstat.log" &
+# PIDSTAT_PID=$!
+# echo "CPU 监控已启动 (PID: ${PIDSTAT_PID})"
+
+# iostat -x 1 > "${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_iostat.log" &
+# IOSTAT_PID=$!
+# echo "I/O 监控已启动 (PID: ${IOSTAT_PID})"
+
+# 清理函数：在退出时终止所有监控进程
+cleanup_monitors() {
+    echo "=== 清理监控进程 ==="
+    kill ${GPU_MON_PID} 2>/dev/null || true
+    # kill ${PIDSTAT_PID} 2>/dev/null || true
+    # kill ${IOSTAT_PID} 2>/dev/null || true
+    echo "监控进程已清理"
+}
+
+# 注册清理函数
+trap cleanup_monitors EXIT
+
+################################################################################
 # 启动训练
 ################################################################################
 
 echo "=== 启动训练 ==="
 echo "RUN_NAME: ${RUN_NAME}"
 echo "LOG_FILE: ${LOG_FILE}"
+echo "性能监控: 已启用"
 
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
@@ -262,8 +310,9 @@ torchrun \
   ${WANDB_FLAGS} \
   ${OPTION_FLAGS} \
   ${COMPILE_FLAGS} \
-  ${SDPA_FLAGS}
-  
+  ${SDPA_FLAGS} \
+  ${PERF_MONITOR_FLAGS}
+
 # --use_ve \
 
 TRAIN_EXIT_CODE=$?
@@ -281,3 +330,6 @@ else
 fi
 
 echo "日志文件: ${LOG_FILE}"
+echo "GPU 监控文件: ${GPU_MON_FILE}"
+# echo "CPU 监控文件: ${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_pidstat.log"
+# echo "I/O 监控文件: ${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_iostat.log"

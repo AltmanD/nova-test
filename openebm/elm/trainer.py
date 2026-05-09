@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from torch.distributed import all_reduce
 import wandb
 import gc
+from openebm.elm.perf_monitor import PerfMonitor
 
 # from data.vid.ucf_dataloader import *
 # from data.vid.kinetics_dataloader import *
@@ -118,6 +119,21 @@ class ModelTrainer(LightningModule):
 
         # Dataloader resume state: 用于从 checkpoint 恢复 dataloader 位置
         self._dataloader_resume_state = None
+
+        # 性能监控器初始化
+        perf_enabled = getattr(self.hparams, 'enable_perf_monitor', False)
+        perf_window_size = getattr(self.hparams, 'perf_window_size', 50)
+        perf_ema_alpha = getattr(self.hparams, 'perf_ema_alpha', 0.05)
+        perf_log_interval = getattr(self.hparams, 'perf_log_interval', 10)
+        perf_cuda_mem_interval = getattr(self.hparams, 'perf_cuda_mem_interval', 50)
+
+        self.perf_monitor = PerfMonitor(
+            enabled=perf_enabled,
+            window_size=perf_window_size,
+            ema_alpha=perf_ema_alpha,
+            log_interval=perf_log_interval,
+            cuda_mem_interval=perf_cuda_mem_interval
+        )
 
         if self.hparams.modality == "NLP":
             if "execution_mode" in self.hparams and "save_generation_logs_dir" in self.hparams and self.hparams.execution_mode == "inference": # two of these are sanity check for loading pretrained ckpt that may not have newer params
@@ -415,6 +431,18 @@ class ModelTrainer(LightningModule):
             things_to_log['pct_gradient_clipped'] = percentage_clipped
             self.log_metrics(things_to_log, "train", log_torchmetrics = False)
         
+    def on_before_optimizer_step(self, optimizer):
+        """在 optimizer step 之前调用，用于性能监控"""
+        # 调用性能监控器
+        self.perf_monitor.on_optimizer_step(
+            global_step=self.global_step,
+            num_gpus=getattr(self.hparams, 'num_gpus', 1),
+            batch_size_per_device=self.hparams.batch_size_per_device,
+            context_length=self.hparams.context_length,
+            accumulate_grad_batches=self.hparams.accumulate_grad_batches,
+            device=self.device
+        )
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)
         if self.hparams.debug_unused_parameters:
@@ -585,6 +613,9 @@ class ModelTrainer(LightningModule):
 
     def on_validation_epoch_start(self):
         """Reset BPB accumulators at the start of each validation epoch."""
+        # 性能监控：记录 validation 开始
+        self.perf_monitor.log_event_start('validation', global_step=self.global_step)
+
         self._val_bpb_nats = 0.0
         self._val_bpb_bytes = 0
 
@@ -621,6 +652,9 @@ class ModelTrainer(LightningModule):
 
     def on_validation_epoch_end(self):
         """Compute epoch-level BPB from accumulated nats/bytes and override the cached value."""
+        # 性能监控：记录 validation 结束
+        self.perf_monitor.log_event_end('validation', global_step=self.global_step)
+
         import math
         if self._val_bpb_bytes > 0:
             epoch_bpb = self._val_bpb_nats / (math.log(2) * self._val_bpb_bytes)
@@ -631,12 +665,19 @@ class ModelTrainer(LightningModule):
             self._last_valid_metrics = {}
         self._last_valid_metrics['bpb'] = epoch_bpb
 
-        # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
-        if self.logger is not None:
-            try:
-                self.logger.experiment.log({'valid_bpb': epoch_bpb}, step=self.global_step)
-            except Exception:
-                pass
+        # 通过 Lightning 的 self.log 上报 valid_bpb，确保 step 对齐
+        # 替换原有的 self.logger.experiment.log()，避免 step 偏移
+        self.log('valid_bpb', epoch_bpb, sync_dist=False, prog_bar=True,
+                 on_step=False, on_epoch=True, rank_zero_only=True)
+
+        # 用 Lightning callback_metrics 中的 epoch-level valid_loss/perplexity 覆盖
+        # 确保控制台打印与 checkpoint 记录一致
+        epoch_valid_loss = self.trainer.callback_metrics.get('valid_loss', None)
+        if epoch_valid_loss is not None:
+            self._last_valid_metrics['loss'] = epoch_valid_loss.item() if hasattr(epoch_valid_loss, 'item') else epoch_valid_loss
+        epoch_valid_ppl = self.trainer.callback_metrics.get('valid_perplexity', None)
+        if epoch_valid_ppl is not None:
+            self._last_valid_metrics['perplexity'] = epoch_valid_ppl.item() if hasattr(epoch_valid_ppl, 'item') else epoch_valid_ppl
 
     def on_test_epoch_start(self):
         """Reset test metrics at the start of test epoch"""
@@ -1932,9 +1973,10 @@ class ModelTrainer(LightningModule):
                 self.log("Alpha_LR", alpha_lr, on_step=True, on_epoch=False)
 
         # Alpha (MCMC step size) 值 (仅 train 阶段，避免 validation 阶段 warning)
-        if phase == "train" and self.hparams.mcmc_step_size_learnable:
-            self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach(),
-                     on_step=True, on_epoch=False)
+        # 已注释：不记录 alpha 到 wandb/tensorboard
+        # if phase == "train" and self.hparams.mcmc_step_size_learnable:
+        #     self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach(),
+        #              on_step=True, on_epoch=False)
 
         # Langevin dynamics noise (仅 train 阶段)
         if phase == "train" and self.hparams.langevin_dynamics_noise_learnable:
@@ -2035,11 +2077,12 @@ class ModelTrainer(LightningModule):
                     valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
 
                 # --- 打印 ---
+                # 不打印 alpha 和 grad 信息
                 alpha_val_str = ""
-                if self.hparams.mcmc_step_size_learnable:
-                    alpha_val = self.model.alpha.detach()
-                    alpha_grad_str = f" grad={self.model.alpha.grad.item():.6f}" if self.model.alpha.grad is not None else " grad=None"
-                    alpha_val_str = f" | alpha: {alpha_val.item():.6f} ({alpha_val.dtype}){alpha_grad_str}"
+                # if self.hparams.mcmc_step_size_learnable:
+                #     alpha_val = self.model.alpha.detach()
+                #     alpha_grad_str = f" grad={self.model.alpha.grad.item():.6f}" if self.model.alpha.grad is not None else " grad=None"
+                #     alpha_val_str = f" | alpha: {alpha_val.item():.6f} ({alpha_val.dtype}){alpha_grad_str}"
                 print(
                     f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
                     f"loss: {loss_val:.6f}"
