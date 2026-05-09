@@ -10,7 +10,9 @@
 # 监控功能（根据 fix.md 监控方案）:
 #   - 外部 GPU 监控: nvidia-smi 1秒采样
 #   - CPU/I/O 监控: pidstat/iostat 1秒采样（如果集群允许）
-#   - 训练侧监控: rolling throughput, CUDA allocator stats, event markers
+#   - 训练侧监控: rolling throughput, rank/data wait skew, CUDA allocator stats, event markers
+#   - 预训练数据管线监控: parquet read, tokenizer encode, best-fit scan, GPU copy, doc_buffer
+#   - 原因判定快照: 对齐 gpu_util_possible_causes_after_sft.md 中各可能原因
 ################################################################################
 
 # Conda 环境激活（仅远程集群需要，本地调试可跳过）
@@ -182,7 +184,7 @@ fi
 # 性能监控配置
 ################################################################################
 
-PERF_MONITOR_FLAGS="--enable_perf_monitor True --perf_window_size 50 --perf_ema_alpha 0.05 --perf_log_interval 10 --perf_cuda_mem_interval 50"
+PERF_MONITOR_FLAGS="--enable_perf_monitor --perf_window_size 50 --perf_ema_alpha 0.05 --perf_log_interval 10 --perf_cuda_mem_interval 50 --perf_data_log_interval 50 --perf_cause_log_interval 200"
 
 ################################################################################
 # WandB 训练标志
@@ -213,28 +215,38 @@ echo "=== 启动外部监控 ==="
 # GPU 监控：nvidia-smi 1秒采样
 GPU_MON_FILE="${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_nvidia_smi.csv"
 nvidia-smi \
-  --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.free,power.draw,clocks.sm,temperature.gpu,pstate \
+  --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.free,power.draw,clocks.sm,temperature.gpu,pstate,pcie.link.gen.current,pcie.link.width.current \
   --format=csv \
   -l 1 \
   -f "${GPU_MON_FILE}" &
 GPU_MON_PID=$!
 echo "GPU 监控已启动 (PID: ${GPU_MON_PID}), 输出到: ${GPU_MON_FILE}"
 
-# CPU/I/O 监控（如果集群允许）
-# pidstat -durh 1 > "${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_pidstat.log" &
-# PIDSTAT_PID=$!
-# echo "CPU 监控已启动 (PID: ${PIDSTAT_PID})"
+# CPU/I/O 监控（如果命令存在则自动启用）
+PIDSTAT_PID=""
+IOSTAT_PID=""
+if command -v pidstat >/dev/null 2>&1; then
+  pidstat -durh 1 > "${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_pidstat.log" &
+  PIDSTAT_PID=$!
+  echo "CPU/进程/I/O wait 监控已启动 (PID: ${PIDSTAT_PID})"
+else
+  echo "pidstat 不存在，跳过 CPU/进程/I/O wait 监控"
+fi
 
-# iostat -x 1 > "${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_iostat.log" &
-# IOSTAT_PID=$!
-# echo "I/O 监控已启动 (PID: ${IOSTAT_PID})"
+if command -v iostat >/dev/null 2>&1; then
+  iostat -x 1 > "${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_iostat.log" &
+  IOSTAT_PID=$!
+  echo "磁盘 I/O 监控已启动 (PID: ${IOSTAT_PID})"
+else
+  echo "iostat 不存在，跳过磁盘 I/O 监控"
+fi
 
 # 清理函数：在退出时终止所有监控进程
 cleanup_monitors() {
     echo "=== 清理监控进程 ==="
     kill ${GPU_MON_PID} 2>/dev/null || true
-    # kill ${PIDSTAT_PID} 2>/dev/null || true
-    # kill ${IOSTAT_PID} 2>/dev/null || true
+    [[ -n "${PIDSTAT_PID}" ]] && kill ${PIDSTAT_PID} 2>/dev/null || true
+    [[ -n "${IOSTAT_PID}" ]] && kill ${IOSTAT_PID} 2>/dev/null || true
     echo "监控进程已清理"
 }
 
@@ -331,5 +343,5 @@ fi
 
 echo "日志文件: ${LOG_FILE}"
 echo "GPU 监控文件: ${GPU_MON_FILE}"
-# echo "CPU 监控文件: ${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_pidstat.log"
-# echo "I/O 监控文件: ${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_iostat.log"
+echo "CPU/进程/I/O wait 监控文件: ${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_pidstat.log"
+echo "磁盘 I/O 监控文件: ${LOG_DIR}/${RUN_NAME}_node${NODE_RANK}_iostat.log"

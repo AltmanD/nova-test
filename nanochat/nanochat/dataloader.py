@@ -16,6 +16,8 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
+import time
+
 import torch
 import pyarrow.parquet as pq
 
@@ -40,6 +42,7 @@ class StatefulBestFitDataLoader:
         self, tokenizer, B, T, split, device="cuda",
         resume_state_dict=None, buffer_size=1000,
         tokenizer_threads=4, tokenizer_batch_size=128,
+        perf_monitor=None,
     ):
         self.tokenizer = tokenizer
         self.B = B
@@ -49,6 +52,7 @@ class StatefulBestFitDataLoader:
         self.buffer_size = buffer_size
         self.tokenizer_threads = tokenizer_threads
         self.tokenizer_batch_size = tokenizer_batch_size
+        self.perf_monitor = perf_monitor
 
         self.bos_token = tokenizer.get_bos_token_id()
         self.row_capacity = T + 1
@@ -150,7 +154,14 @@ class StatefulBestFitDataLoader:
             pq_idx = self.next_pq_idx if first_pass else 0
             while pq_idx < len(self._parquet_paths):
                 filepath = self._parquet_paths[pq_idx]
+                open_start = time.perf_counter()
                 pf = pq.ParquetFile(filepath)
+                if self.perf_monitor is not None:
+                    self.perf_monitor.record_data_pipeline(
+                        "parquet_open_s",
+                        time.perf_counter() - open_start,
+                        meta={"split": self.split, "pq_idx": pq_idx, "parquet_file": filepath},
+                    )
 
                 # Determine starting rg_idx
                 if first_pass and pq_idx == self.next_pq_idx:
@@ -176,8 +187,21 @@ class StatefulBestFitDataLoader:
                 skip_doc_batches = self.next_doc_batch_index if (first_pass and pq_idx == self.next_pq_idx and rg_idx == self.next_rg_idx) else 0
 
                 while rg_idx < pf.num_row_groups:
+                    read_start = time.perf_counter()
                     rg = pf.read_row_group(rg_idx)
                     batch = rg.column('text').to_pylist()
+                    if self.perf_monitor is not None:
+                        self.perf_monitor.record_data_pipeline(
+                            "parquet_read_s",
+                            time.perf_counter() - read_start,
+                            meta={
+                                "split": self.split,
+                                "pq_idx": pq_idx,
+                                "rg_idx": rg_idx,
+                                "epoch": epoch,
+                                "row_group_rows": len(batch),
+                            },
+                        )
                     doc_batch_index = 0
                     for i in range(0, len(batch), self.tokenizer_batch_size):
                         if skip_doc_batches > 0:
@@ -214,15 +238,38 @@ class StatefulBestFitDataLoader:
         doc_iter = self._doc_batch_iter()
 
         def refill_buffer():
-            text_batch, _, _, _ = next(doc_iter)
+            refill_start = time.perf_counter()
+            text_batch, pq_idx, rg_idx, epoch = next(doc_iter)
+            tokenize_start = time.perf_counter()
             token_lists = self.tokenizer.encode(
                 text_batch, prepend=self.bos_token, num_threads=self.tokenizer_threads
             )
+            tokenize_dt = time.perf_counter() - tokenize_start
             for tokens in token_lists:
                 doc_buffer.append(tokens)
+            if self.perf_monitor is not None:
+                doc_lengths = [len(tokens) for tokens in doc_buffer[-len(token_lists):]] if token_lists else []
+                self.perf_monitor.record_data_pipeline(
+                    "tokenize_s",
+                    tokenize_dt,
+                    meta={
+                        "split": self.split,
+                        "pq_idx": pq_idx,
+                        "rg_idx": rg_idx,
+                        "epoch": epoch,
+                        "text_batch_size": len(text_batch),
+                        "tokenized_docs": len(token_lists),
+                        "tokenized_mean_len": f"{(sum(doc_lengths) / max(len(doc_lengths), 1)):.1f}",
+                    },
+                )
+                self.perf_monitor.record_data_pipeline(
+                    "buffer_refill_s",
+                    time.perf_counter() - refill_start,
+                    meta={"doc_buffer_len": len(doc_buffer)},
+                )
 
         # Pre-allocate buffers
-        use_cuda = self.device == "cuda"
+        use_cuda = str(self.device).startswith("cuda")
         row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
         cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
         gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=self.device)
@@ -232,6 +279,10 @@ class StatefulBestFitDataLoader:
         targets = gpu_buffer[B * T:].view(B, T)
 
         while True:
+            yield_start = time.perf_counter()
+            crop_count = 0
+            scan_count = 0
+            pack_start = time.perf_counter()
             for row_idx in range(B):
                 pos = 0
                 while pos < row_capacity:
@@ -243,11 +294,20 @@ class StatefulBestFitDataLoader:
                     # Find largest doc that fits entirely
                     best_idx = -1
                     best_len = 0
+                    scan_start = time.perf_counter()
                     for i, doc in enumerate(doc_buffer):
                         doc_len = len(doc)
                         if doc_len <= remaining and doc_len > best_len:
                             best_idx = i
                             best_len = doc_len
+                    scan_dt = time.perf_counter() - scan_start
+                    scan_count += 1
+                    if self.perf_monitor is not None:
+                        self.perf_monitor.record_data_pipeline(
+                            "bestfit_scan_s",
+                            scan_dt,
+                            meta={"doc_buffer_len": len(doc_buffer)},
+                        )
 
                     if best_idx >= 0:
                         doc = doc_buffer.pop(best_idx)
@@ -259,13 +319,33 @@ class StatefulBestFitDataLoader:
                         doc = doc_buffer.pop(shortest_idx)
                         row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
                         pos += remaining
+                        crop_count += 1
 
+            if self.perf_monitor is not None:
+                self.perf_monitor.record_data_pipeline(
+                    "pack_rows_s",
+                    time.perf_counter() - pack_start,
+                    meta={
+                        "doc_buffer_len": len(doc_buffer),
+                        "doc_buffer_mean_len": f"{(sum(len(doc) for doc in doc_buffer) / max(len(doc_buffer), 1)):.1f}",
+                        "crop_count": crop_count,
+                        "scan_count": scan_count,
+                    },
+                )
+
+            cpu_copy_start = time.perf_counter()
             cpu_inputs.copy_(row_buffer[:, :-1])
             cpu_targets.copy_(row_buffer[:, 1:])
+            if self.perf_monitor is not None:
+                self.perf_monitor.record_data_pipeline("cpu_copy_s", time.perf_counter() - cpu_copy_start)
 
             sd = self.state_dict()
 
+            gpu_copy_start = time.perf_counter()
             gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+            if self.perf_monitor is not None:
+                self.perf_monitor.record_data_pipeline("gpu_copy_s", time.perf_counter() - gpu_copy_start)
+                self.perf_monitor.record_data_pipeline("yield_total_s", time.perf_counter() - yield_start)
             yield inputs, targets, sd
 
 
@@ -277,7 +357,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000,
+    perf_monitor=None,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -288,6 +369,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         tokenizer=tokenizer, B=B, T=T, split=split, device=device,
         resume_state_dict=resume_state_dict, buffer_size=buffer_size,
         tokenizer_threads=tokenizer_threads, tokenizer_batch_size=tokenizer_batch_size,
+        perf_monitor=perf_monitor,
     )
     yield from loader
 

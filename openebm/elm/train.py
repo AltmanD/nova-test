@@ -211,8 +211,8 @@ def main(args):
     checkpoint_filename = f"s={{step}}-{args.model_size}-ctx{args.context_length}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
     save_last = (args.save_periodic_steps <= 0)  # periodic 启用时不需要 last.ckpt，periodic 已覆盖 crash recovery
 
-    # 获取性能监控器实例（如果启用）
-    perf_monitor = model_trainer.perf_monitor if getattr(model_trainer, 'perf_monitor', None) is not None else None
+    # 获取性能监控器实例（如果启用）。未启用时不给 checkpoint 回调传入，保持 no-op。
+    perf_monitor = model_trainer.perf_monitor if getattr(getattr(model_trainer, 'perf_monitor', None), 'enabled', False) else None
 
     checkpoint_callback = DiskAwareCheckpoint(
         monitor=args.checkpoint_monitor_string,
@@ -914,12 +914,15 @@ if __name__ == '__main__':
 
     parser.add_argument("--manual_gc_collect_every_n_steps", help="manually call gc collect every n steps, can be done to prevent CPU RAM memory 'leak'", type = int, default=-1)
 
-    # 性能监控参数（根据 fix.md 监控方案）
-    parser.add_argument("--enable_perf_monitor", help="enable performance monitoring (rolling throughput, CUDA allocator stats, event markers)", type=bool, default=False)
+    # 性能监控参数（根据 fix.md 和 gpu_util_possible_causes_after_sft.md 监控方案）
+    parser.add_argument("--enable_perf_monitor", help="enable performance monitoring (rolling throughput, data pipeline stats, CUDA allocator stats, event markers)", action="store_true", default=False)
     parser.add_argument("--perf_window_size", help="rolling window size for performance metrics (optimizer steps)", type=int, default=50)
     parser.add_argument("--perf_ema_alpha", help="EMA alpha for tokens/sec smoothing", type=float, default=0.05)
     parser.add_argument("--perf_log_interval", help="log performance metrics every N optimizer steps", type=int, default=10)
     parser.add_argument("--perf_cuda_mem_interval", help="log CUDA memory stats every N optimizer steps", type=int, default=50)
+    parser.add_argument("--perf_data_log_interval", help="log nanochat pretrain data pipeline stats every N optimizer steps", type=int, default=50)
+    parser.add_argument("--perf_cause_log_interval", help="log cause-diagnosis snapshot every N optimizer steps", type=int, default=200)
+    parser.add_argument("--disable_perf_data_pipeline", dest="perf_monitor_data_pipeline", help="disable nanochat pretrain data pipeline instrumentation while keeping other perf monitors", action="store_false", default=True)
 
     parser.add_argument("--debug_videos", help="debug generated videos in a grid", action="store_true", default=False)
 

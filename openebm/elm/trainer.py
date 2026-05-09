@@ -120,19 +120,36 @@ class ModelTrainer(LightningModule):
         # Dataloader resume state: 用于从 checkpoint 恢复 dataloader 位置
         self._dataloader_resume_state = None
 
-        # 性能监控器初始化
+        # 性能监控器初始化。默认关闭；通过 --enable_perf_monitor 显式开启。
         perf_enabled = getattr(self.hparams, 'enable_perf_monitor', False)
         perf_window_size = getattr(self.hparams, 'perf_window_size', 50)
         perf_ema_alpha = getattr(self.hparams, 'perf_ema_alpha', 0.05)
         perf_log_interval = getattr(self.hparams, 'perf_log_interval', 10)
         perf_cuda_mem_interval = getattr(self.hparams, 'perf_cuda_mem_interval', 50)
+        perf_data_log_interval = getattr(self.hparams, 'perf_data_log_interval', 50)
+        perf_cause_log_interval = getattr(self.hparams, 'perf_cause_log_interval', 200)
+        perf_monitor_data_pipeline = getattr(self.hparams, 'perf_monitor_data_pipeline', True)
 
         self.perf_monitor = PerfMonitor(
             enabled=perf_enabled,
             window_size=perf_window_size,
             ema_alpha=perf_ema_alpha,
             log_interval=perf_log_interval,
-            cuda_mem_interval=perf_cuda_mem_interval
+            cuda_mem_interval=perf_cuda_mem_interval,
+            data_log_interval=perf_data_log_interval,
+            cause_log_interval=perf_cause_log_interval,
+            monitor_data_pipeline=perf_monitor_data_pipeline,
+            run_context={
+                'dataset_name': getattr(self.hparams, 'dataset_name', None),
+                'num_nodes': getattr(self.hparams, 'num_nodes', None),
+                'num_gpus': getattr(self.hparams, 'num_gpus', None),
+                'float_precision': getattr(self.hparams, 'float_precision', None),
+                'compile_model': getattr(self.hparams, 'compile_model', None),
+                'compile_mode': getattr(self.hparams, 'compile_mode', None),
+                'optimizer': getattr(self.hparams, 'optimizer', None),
+                'peak_learning_rate': getattr(self.hparams, 'peak_learning_rate', None),
+                'weight_decay': getattr(self.hparams, 'weight_decay', None),
+            },
         )
 
         if self.hparams.modality == "NLP":
@@ -431,6 +448,10 @@ class ModelTrainer(LightningModule):
             things_to_log['pct_gradient_clipped'] = percentage_clipped
             self.log_metrics(things_to_log, "train", log_torchmetrics = False)
         
+    def on_train_batch_start(self, batch, batch_idx):
+        """记录 data wait 起点，用于区分数据瓶颈与计算瓶颈。"""
+        self.perf_monitor.mark_batch_start(global_step=self.global_step)
+
     def on_before_optimizer_step(self, optimizer):
         """在 optimizer step 之前调用，用于性能监控"""
         # 调用性能监控器
@@ -444,6 +465,7 @@ class ModelTrainer(LightningModule):
         )
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
+        self.perf_monitor.mark_batch_end(global_step=self.global_step)
         #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)
         if self.hparams.debug_unused_parameters:
             all_parameters = {name for name, _ in self.model.named_parameters()}
@@ -1778,6 +1800,7 @@ class ModelTrainer(LightningModule):
                 split="train",
                 device=self.device,
                 resume_state_dict=resume_state,
+                perf_monitor=self.perf_monitor,
             )
         return train_dataloader
 
@@ -1820,6 +1843,7 @@ class ModelTrainer(LightningModule):
                 split="val",
                 device=self.device,
                 resume_state_dict=None,
+                perf_monitor=self.perf_monitor,
             )
 
         return val_dataloader
