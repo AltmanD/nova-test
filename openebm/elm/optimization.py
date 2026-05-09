@@ -1,3 +1,4 @@
+import math
 import torch
 from torch import optim
 from torch.optim.lr_scheduler import _LRScheduler
@@ -88,7 +89,8 @@ class WarmUpLinearWarmdownLR(_LRScheduler):
     - final_lr_frac=0.0 (衰减到 0)
     """
     def __init__(self, optimizer, warmup_ratio, warmdown_ratio, final_lr_frac, total_steps,
-                 warm_up_finished_func=None, enable_wd_decay=False, resume_warmup_steps=0):
+                 warm_up_finished_func=None, enable_wd_decay=False, resume_warmup_steps=0,
+                 wd_decay_style='linear'):
         self.warmup_steps = int(warmup_ratio * total_steps)
         self.warmdown_steps = int(warmdown_ratio * total_steps)
         self.constant_steps = total_steps - self.warmup_steps - self.warmdown_steps
@@ -106,6 +108,7 @@ class WarmUpLinearWarmdownLR(_LRScheduler):
 
         # Option 2 兼容: 动态 Weight Decay
         self.enable_wd_decay = enable_wd_decay
+        self.wd_decay_style = wd_decay_style  # 'linear' or 'cosine'
         self.initial_weight_decays = [group.get('weight_decay', 0) for group in optimizer.param_groups]
 
         self._last_lr = [0.0 for _ in self.highest_lr] if self.warmup_steps > 0 else self.highest_lr.copy()
@@ -126,7 +129,10 @@ class WarmUpLinearWarmdownLR(_LRScheduler):
         """计算原始 LR schedule 值 (不含 resume warmup 调整)"""
         # Option 2 兼容: 动态更新 weight decay
         if self.enable_wd_decay and self.total_steps > 0:
-            wd_multiplier = max(0.0, 1.0 - self.last_step / self.total_steps)
+            if self.wd_decay_style == 'cosine':
+                wd_multiplier = 0.5 * (1 + math.cos(math.pi * self.last_step / self.total_steps))
+            else:  # linear (default)
+                wd_multiplier = max(0.0, 1.0 - self.last_step / self.total_steps)
             for i, group in enumerate(self.optimizer.param_groups):
                 if self.initial_weight_decays[i] > 0:
                     group['weight_decay'] = self.initial_weight_decays[i] * wd_multiplier

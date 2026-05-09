@@ -433,20 +433,38 @@ class ModelTrainer(LightningModule):
                 torch.cuda.empty_cache()
 
         # --- Muon momentum 预热调度 (参考 NanoChat base_train.py:360-363) ---
-        # Muon momentum 从 0.85 线性预热到 0.95，前 300 步完成
+        # Muon momentum 从 0.85 线性预热到 target_momentum，前 muon_warmup_steps 步完成
         # 通过 --muon_momentum_warmup_steps 控制（默认 300，设 0 禁用）
         muon_warmup_steps = getattr(self.hparams, 'muon_momentum_warmup_steps', 300)
+        muon_target_momentum = getattr(self.hparams, 'muon_momentum', 0.95)
         if muon_warmup_steps > 0 and self.global_step <= muon_warmup_steps:
             if hasattr(self, 'trainer') and self.trainer.optimizers:
                 optimizer = self.trainer.optimizers[0]
                 if hasattr(optimizer, 'param_groups'):
-                    target_momentum = getattr(self.hparams, 'muon_momentum', 0.95)
                     base_momentum = 0.85
                     frac = min(self.global_step / muon_warmup_steps, 1.0)
-                    current_momentum = (1 - frac) * base_momentum + frac * target_momentum
+                    current_momentum = (1 - frac) * base_momentum + frac * muon_target_momentum
                     for group in optimizer.param_groups:
                         if group.get('kind') == 'muon':
                             group['momentum'] = current_momentum
+
+        # --- Muon momentum warmdown 衰减 (参考 NanoChat base_train.py:372-382) ---
+        # 在 warmdown 阶段，momentum 从 muon_target_momentum 线性衰减到 0.90
+        # warmdown_start = total_steps - warmdown_steps
+        if muon_warmup_steps > 0 and self.global_step > muon_warmup_steps:
+            if hasattr(self, 'trainer') and self.trainer.optimizers:
+                optimizer = self.trainer.optimizers[0]
+                if hasattr(optimizer, 'param_groups'):
+                    total_steps = getattr(self.hparams, 'max_scheduling_steps', 0)
+                    warmdown_ratio = getattr(self.hparams, 'warmdown_ratio', 0.5)
+                    warmdown_steps = int(warmdown_ratio * total_steps) if total_steps > 0 else 0
+                    warmdown_start = total_steps - warmdown_steps if total_steps > 0 else 0
+                    if warmdown_steps > 0 and self.global_step >= warmdown_start:
+                        progress = min((self.global_step - warmdown_start) / warmdown_steps, 1.0)
+                        current_momentum = muon_target_momentum * (1 - progress) + 0.90 * progress
+                        for group in optimizer.param_groups:
+                            if group.get('kind') == 'muon':
+                                group['momentum'] = current_momentum
 
         # Record step end time for dt calculation
         import time as _time
@@ -1108,6 +1126,7 @@ class ModelTrainer(LightningModule):
             final_lr_frac = getattr(self.hparams, 'final_lr_frac', 0.0)
             resume_warmup_steps = getattr(self.hparams, 'resume_warmup_steps', 0)
 
+            wd_decay_style = getattr(self.hparams, 'wd_decay_style', 'linear')
             lr_scheduler = WarmUpLinearWarmdownLR(
                 optimizer,
                 warmup_ratio=warmup_ratio,
@@ -1116,7 +1135,8 @@ class ModelTrainer(LightningModule):
                 total_steps=self.hparams.max_scheduling_steps,
                 warm_up_finished_func=self.on_warm_up_finished,
                 enable_wd_decay=enable_wd_decay,
-                resume_warmup_steps=resume_warmup_steps
+                resume_warmup_steps=resume_warmup_steps,
+                wd_decay_style=wd_decay_style
             )
         else:
             # 原始 Cosine Annealing 调度

@@ -675,6 +675,7 @@ if __name__ == '__main__':
 
     # Option 2: 动态 Weight Decay 参数
     parser.add_argument("--dynamic_wd", help="[Option 2] 启用动态 Weight Decay，线性衰减到 0", action="store_true", default=False)
+    parser.add_argument("--wd_decay_style", help="[Option 2] Weight Decay 衰减方式: linear (线性衰减到 0) 或 cosine (余弦衰减到 0, 参考 NanoChat)", type=str, default='linear', choices=['linear', 'cosine'])
 
     # Option 3: Linear Warmdown LR 调度参数
     parser.add_argument("--linear_warmdown", help="[Option 3] 启用 NanoChat 风格的 Linear Warmdown LR 调度", action="store_true", default=False)
