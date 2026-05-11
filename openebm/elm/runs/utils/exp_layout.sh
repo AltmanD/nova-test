@@ -194,15 +194,26 @@ exp_init_sft() {
     fi
 
     export EXP_DIR="${EBT_RUNS_ROOT}/${EXP_ID}"
+    mkdir -p "${EXP_DIR}"
     local stage_dir="${EXP_DIR}/sft_train"
 
-    if [ -d "$stage_dir" ]; then
+    # Pick and create the SFT stage directory atomically. The old check-then-mkdir
+    # sequence was racy: two SFT jobs launched at nearly the same time could both
+    # decide to use sft_train/, then share train.log/checkpoints/wandb files. That
+    # made the second job look like wandb was not recording. mkdir is atomic on the
+    # filesystem, so only one process can claim a directory name.
+    if mkdir "${stage_dir}" 2>/dev/null; then
+        :
+    else
         local version=2
-        while [ -d "${EXP_DIR}/sft_train.v${version}" ]; do
+        while true; do
+            stage_dir="${EXP_DIR}/sft_train.v${version}"
+            if mkdir "${stage_dir}" 2>/dev/null; then
+                echo "  注意: sft_train/ 已存在，使用 $(basename "$stage_dir")"
+                break
+            fi
             version=$((version + 1))
         done
-        stage_dir="${EXP_DIR}/sft_train.v${version}"
-        echo "  注意: sft_train/ 已存在，使用 $(basename $stage_dir)"
     fi
 
     export EXP_CKPT_DIR="${stage_dir}/checkpoints"
@@ -235,6 +246,7 @@ EOREF
     echo "  EXP_ID:       ${EXP_ID}"
     echo "  SFT dir:      ${stage_dir}"
     echo "  Checkpoints:  ${EXP_CKPT_DIR}"
+    echo "  WandB dir:    ${EXP_WANDB_DIR}"
     echo "  Log file:     ${EXP_LOG_FILE}"
 }
 

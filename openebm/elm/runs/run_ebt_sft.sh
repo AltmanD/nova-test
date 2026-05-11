@@ -188,10 +188,12 @@ source "${SCRIPT_DIR}/utils/exp_layout.sh"
 
 export PRETRAIN_CKPT="${PRETRAIN_CKPT}"
 exp_init_sft "$0"
-export RUN_NAME="${EXP_ID}-sft"
+export SFT_RUN_DIR="$(dirname "$(dirname "${EXP_LOG_FILE}")")"
+export SFT_RUN_TAG="$(basename "${SFT_RUN_DIR}")"
+export RUN_NAME="${EXP_ID}-${SFT_RUN_TAG}"
 export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
-exp_save_hparams "${EXP_DIR}/sft_train" \
+exp_save_hparams "${SFT_RUN_DIR}" \
     "model_size=${MODEL_SIZE}" \
     "context_length=${CONTEXT_LENGTH}" \
     "peak_lr=${PEAK_LR}" \
@@ -220,7 +222,10 @@ echo "Pretrain ckpt: ${PRETRAIN_CKPT}"
 echo "Dataset:       nanochat_sft"
 echo "Peak LR:       ${PEAK_LR}"
 echo "Max steps:     ${MAX_STEPS}"
+echo "Run name:      ${RUN_NAME}_${current_time}"
+echo "Run dir:       ${SFT_RUN_DIR}"
 echo "Log file:      ${LOG_FILE}"
+echo "WandB dir:     nova/logs (train.py repository-root default)"
 echo ""
 read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
 
@@ -255,10 +260,13 @@ echo ""
 echo "================================================================================"
 echo "[SFT 训练配置]"
 echo "================================================================================"
+echo "Run Name:            ${RUN_NAME}_${current_time}"
+echo "Run Dir:             ${SFT_RUN_DIR}"
 echo "Pretrain Checkpoint: ${PRETRAIN_CKPT}"
 echo "Dataset:             nanochat_sft"
 echo "Peak LR:             ${PEAK_LR}"
 echo "Max Steps:           ${MAX_STEPS}"
+echo "WandB Save Dir:      nova/logs (train.py repository-root default)"
 echo ""
 echo "================================================================================"
 echo "[开始训练]"
@@ -270,7 +278,6 @@ set -e
 torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/train.py \
 --run_name ${RUN_NAME}_${current_time} \
 --checkpoint_dir "${EXP_CKPT_DIR}" \
---wandb_save_dir "${EXP_WANDB_DIR}" \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \
 --model_size ${MODEL_SIZE} \
@@ -294,7 +301,6 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --max_steps ${MAX_STEPS} \
 --max_scheduling_steps ${MAX_SCHEDULING_STEPS} \
 --dataset_name "nanochat_sft" \
---num_workers ${NUM_WORKERS} \
 --val_check_interval ${VAL_CHECK_INTERVAL} \
 --limit_val_batches ${LIMIT_VAL_BATCHES} \
 --val_sanity 1 \
@@ -313,7 +319,7 @@ ${COMPILE_FLAGS}
 TRAIN_EXIT_CODE=$?
 set -e
 
-exp_save_status "${EXP_DIR}/sft_train" "sft_train" "$TRAIN_EXIT_CODE"
+exp_save_status "${SFT_RUN_DIR}" "${SFT_RUN_TAG}" "$TRAIN_EXIT_CODE"
 
 if [ $TRAIN_EXIT_CODE -eq 0 ]; then
     echo -e "\033[0;32m✓ SFT 训练成功完成\033[0m"

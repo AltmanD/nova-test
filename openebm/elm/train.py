@@ -37,14 +37,47 @@ from openebm.elm.eval import nlp_eval_acc
 from openebm.elm.trainer import ModelTrainer
 from openebm.elm.utils import init_wandb_watch, model_sizes
 
+def get_default_wandb_save_dir():
+    """Return the repository-root logs directory used for all wandb offline files."""
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "logs"))
+
+
+def resolve_wandb_save_dir(save_dir):
+    """Resolve wandb save_dir without depending on the shell's current cwd."""
+    if save_dir is None or save_dir == "":
+        return get_default_wandb_save_dir()
+    if save_dir in ("logs", "logs/", "./logs", "./logs/"):
+        return get_default_wandb_save_dir()
+    return os.path.abspath(save_dir)
+
+
 @rank_zero_only # to ensure only one wandb run is created, if didnt do that then each GPU would create its own wandb run
-def setup_wandb(args): 
+def setup_wandb(args):
     import wandb
+
+    # Use a repository-root default directory instead of cwd-relative "logs/".
+    # This keeps all runs under nova/logs/wandb even when scripts are launched
+    # from different working directories. Scripts can still override this by
+    # passing an absolute --wandb_save_dir.
+    wandb_dir = resolve_wandb_save_dir(args.wandb_save_dir)
+    os.makedirs(wandb_dir, exist_ok=True)
+    mode = "offline" if args.wandb_offline else "online"
+
     if wandb.run is None:
-        run = wandb.init(dir="logs/", name=f'{args.run_name}', entity=f'{args.wandb_entity}', project=f'{args.wandb_project}', mode = "offline" if args.wandb_offline else "online") # this is solely used to force wandb to start tracking stdout in logs
+        run = wandb.init(
+            dir=wandb_dir,
+            name=f'{args.run_name}',
+            entity=args.wandb_entity or None,
+            project=f'{args.wandb_project}',
+            mode=mode,
+            resume="never",
+        ) # this is solely used to force wandb to start tracking stdout in logs
         wandb.define_metric("__init", hidden=True)
+        print(f"[W&B] initialized run: name={run.name}, id={run.id}, mode={mode}, dir={wandb_dir}", flush=True)
         return run
-    return None
+
+    print(f"[W&B] reusing active run: name={wandb.run.name}, id={wandb.run.id}, dir={wandb_dir}", flush=True)
+    return wandb.run
 
 def main(args):
     # --disable_wandb is an alias for --no_wandb
@@ -61,7 +94,10 @@ def main(args):
         args.detect_anomaly = True
         args.limit_train_batches = 1
 
-    os.makedirs("./logs", exist_ok=True)
+    default_log_dir = get_default_wandb_save_dir()
+    os.makedirs(default_log_dir, exist_ok=True)
+    args.wandb_save_dir = resolve_wandb_save_dir(args.wandb_save_dir)
+    os.makedirs(args.wandb_save_dir, exist_ok=True)
 
     wandb_logger = None
     if not args.no_wandb: # put this early so can capture text logs later
@@ -863,7 +899,7 @@ if __name__ == '__main__':
     parser.add_argument("--checkpoint_dir", type=str, default="",
         help="Override checkpoint directory (default: ./logs/checkpoints/{run_name})")
     parser.add_argument("--wandb_save_dir", type=str, default="logs/",
-        help="Override WandB save directory")
+        help="Override WandB save directory. Default 'logs/' is resolved to the repository-root nova/logs, not the shell cwd.")
 
     parser.add_argument("--save_periodic_steps", type=int, default=0,
         help="Save checkpoint every N training steps regardless of val_loss (0=disabled). Useful for SFT where val_loss may rise while task performance improves.")

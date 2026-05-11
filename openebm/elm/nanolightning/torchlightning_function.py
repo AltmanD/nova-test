@@ -259,19 +259,24 @@ class WandbLogger:
             return self._experiment
 
         # Lazily initialize a new wandb run
+        import os
         import wandb
 
+        save_dir = os.path.abspath(self._save_dir or "logs/")
+        os.makedirs(save_dir, exist_ok=True)
+
         if wandb.run is not None:
-            # Reuse the currently active global run
+            # Reuse the currently active global run in this process.
             self._experiment = wandb.run
         else:
             mode = "offline" if self._offline else "online"
             self._experiment = wandb.init(
-                dir=self._save_dir,
+                dir=save_dir,
                 name=self._name,
-                entity=self._entity,
+                entity=self._entity or None,
                 project=self._project,
                 mode=mode,
+                resume="never",
                 **self._kwargs,
             )
         return self._experiment
