@@ -1,11 +1,11 @@
-import torch
 from nanochat.dataloader import StatefulBestFitDataLoader
 from torch.utils.data import DataLoader
 from torch.utils.data import IterableDataset as _IterableDataset
 
+
 class IterableDataset(_IterableDataset):
     """
-    Wraps StatefulBestFitDataLoader into a PyTorch IterableDataset.
+    Wrap StatefulBestFitDataLoader into a PyTorch IterableDataset.
 
     This keeps:
     - infinite streaming
@@ -23,6 +23,7 @@ class IterableDataset(_IterableDataset):
         max_iter,
         device="cuda",
         resume_state_dict=None,
+        enable_profiling=False,
     ):
         super().__init__()
 
@@ -33,9 +34,10 @@ class IterableDataset(_IterableDataset):
         self.max_iter = max_iter
         self.device = device
         self.resume_state_dict = resume_state_dict
+        self.enable_profiling = enable_profiling
         self.batch_idx = 0
-        self.last_state_dict = None  # 最新的 dataloader 位置，用于 checkpoint 恢复
-        self._stateful_loader = None  # holds StatefulBestFitDataLoader instance
+        self.last_state_dict = None
+        self._stateful_loader = None
 
     def __iter__(self):
         self._stateful_loader = StatefulBestFitDataLoader(
@@ -45,6 +47,7 @@ class IterableDataset(_IterableDataset):
             split=self.split,
             device=self.device,
             resume_state_dict=self.resume_state_dict,
+            enable_profiling=self.enable_profiling,
         )
         for inputs, targets, state_dict in self._stateful_loader:
             self.last_state_dict = state_dict
@@ -54,14 +57,27 @@ class IterableDataset(_IterableDataset):
         """Return exact-resume state (includes doc_buffer)."""
         if self._stateful_loader is not None:
             return self._stateful_loader.state_dict()
-        return self.last_state_dict  # fallback
+        return self.last_state_dict
+
+    def get_last_batch_profile(self):
+        if self._stateful_loader is not None and hasattr(self._stateful_loader, "get_last_batch_profile"):
+            return self._stateful_loader.get_last_batch_profile()
+        return None
 
     def __len__(self):
         return self.max_iter
 
 
-def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device, resume_state_dict=None):
-
+def generate_dataloader(
+    tokenizer,
+    batch_size,
+    max_len,
+    max_iter,
+    split,
+    device,
+    resume_state_dict=None,
+    enable_profiling=False,
+):
     dataset = IterableDataset(
         tokenizer=tokenizer,
         batch_size=batch_size,
@@ -70,13 +86,18 @@ def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device,
         max_iter=max_iter,
         device=device,
         resume_state_dict=resume_state_dict,
+        enable_profiling=enable_profiling,
     )
 
     dataloader = DataLoader(
         dataset,
-        batch_size=1,      # IMPORTANT
+        batch_size=1,   # IMPORTANT
         shuffle=False,
-        num_workers=0,        # keep 0 for stateful streaming
-        pin_memory=False      # already handled internally
+        # Keep 0: the wrapped loader is a stateful IterableDataset that owns
+        # exact-resume position/doc_buffer state and also materializes GPU
+        # tensors inside __iter__(). Forking workers would duplicate iterator
+        # state across processes and make resume / CUDA handoff semantics unsafe.
+        num_workers=0,
+        pin_memory=False,
     )
     return dataloader
