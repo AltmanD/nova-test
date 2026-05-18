@@ -13,6 +13,7 @@ from openebm.elm.utils import setup_ebt, init_whole_model_weights
 from openebm.elm.utils import MLP, Memory_Augmented_MLP, Memory_Gating_MLP, mask_q_tokens
 from openebm.elm.replay_buffer import CausalReplayBuffer
 from openebm.elm.metrics import calculate_bpb_score
+from openebm.elm.sigreg import compute_sigreg_ddp
 
 import ipdb
 
@@ -82,7 +83,7 @@ class EBT_NLP(LightningModule):
     @torch.compiler.disable
     def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps,
                       langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
-                      real_token_ids=None):
+                      real_token_ids=None, return_h_pre=False):
         batch_size = predicted_tokens.shape[0]
         seq_length = predicted_tokens.shape[1]
         
@@ -121,13 +122,18 @@ class EBT_NLP(LightningModule):
         # create_graph=True 的 autograd.grad 与 compiled graph 不兼容
         # 所以若 transformer 已被 torch.compile 编译，MCMC 中需要用 eager 版本
         transformer = getattr(self, 'transformer_eager', self.transformer)
-        energy_preds = transformer(
-            all_embeddings,
+        transformer_kwargs = dict(
             start_pos=start_pos,
             mcmc_step=mcmc_step,
             real_token_ids=real_token_ids,
             predicted_tokens=predicted_tokens,
-        ) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+        )
+        if return_h_pre:
+            transformer_kwargs["return_h_pre"] = True
+        energy_preds = transformer(all_embeddings, **transformer_kwargs) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+        h_pre = None
+        if return_h_pre:
+            energy_preds, h_pre = energy_preds
         energy_preds = energy_preds.reshape(-1, 1)
         
         with torch.amp.autocast(device_type='cuda', enabled=False):
@@ -164,12 +170,15 @@ class EBT_NLP(LightningModule):
             predicted_tokens_for_loss = predicted_tokens # BS, S, V
         else:
             predicted_tokens_for_loss = self.log_softmax(predicted_tokens).reshape(-1, self.vocab_size) # BS*S, V
-            
+
+        if return_h_pre:
+            return predicted_tokens, energy_preds, predicted_tokens_for_loss, h_pre
         return predicted_tokens, energy_preds, predicted_tokens_for_loss
 
-    def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
+    def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True, return_final_h_pre = False): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
         predicted_distributions = []
         predicted_energies = []
+        final_h_pre = None
 
         real_embeddings_input = self.embeddings(x)
         batch_size = x.shape[0]
@@ -217,30 +226,48 @@ class EBT_NLP(LightningModule):
 
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
-                
-                predicted_tokens, energy_preds, predicted_tokens_for_loss = self._mcmc_step_excluded(
+                should_return_h_pre = return_final_h_pre and i == (len(mcmc_steps) - 1)
+                mcmc_result = self._mcmc_step_excluded(
                     predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
                     langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
-                    real_token_ids=x
+                    real_token_ids=x,
+                    return_h_pre=should_return_h_pre,
                 )
+                if should_return_h_pre:
+                    predicted_tokens, energy_preds, predicted_tokens_for_loss, final_h_pre = mcmc_result
+                else:
+                    predicted_tokens, energy_preds, predicted_tokens_for_loss = mcmc_result
                 predicted_energies.append(energy_preds)
                 predicted_distributions.append(predicted_tokens_for_loss)
                 del energy_preds, predicted_tokens_for_loss  # release references to help GC
 
+        if return_final_h_pre:
+            return predicted_distributions, predicted_energies, final_h_pre
         return predicted_distributions, predicted_energies
 
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
         no_randomness = False if phase == "train" else True
+        sigreg_lambda = getattr(self.hparams, 'sigreg_lambda', 0.0)
+        use_sigreg = sigreg_lambda > 0.0
+        final_h_pre = None
         if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
             # all_tokens = x['input_ids'].squeeze(dim=1)
             all_tokens = x[0].squeeze(dim=0)
             input_ids, replay_buffer_logits, next_token_indices = self.replay_buffer.get_batch(all_tokens) # this automatically does indexing for input ids and next token indices while also passing back the logits
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness)
+            forward_result = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness, return_final_h_pre=use_sigreg)
+            if use_sigreg:
+                predicted_distributions, predicted_energies, final_h_pre = forward_result
+            else:
+                predicted_distributions, predicted_energies = forward_result
             self.replay_buffer.update(all_tokens.detach(), predicted_distributions[-1].detach()) # update using the final predicted distributions
         else:
             input_ids = x[0].squeeze(dim=0)
             next_token_indices = x[1].squeeze(dim=0)
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
+            forward_result = self(input_ids, return_raw_logits = True, no_randomness = no_randomness, return_final_h_pre=use_sigreg)
+            if use_sigreg:
+                predicted_distributions, predicted_energies, final_h_pre = forward_result
+            else:
+                predicted_distributions, predicted_energies = forward_result
 
             # input_ids = x['input_ids'].squeeze(dim=1)[:, :-1]
             # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
@@ -292,6 +319,26 @@ class EBT_NLP(LightningModule):
         else:
             total_loss = self.hparams.reconstruction_coeff * reconstruction_loss
             contrastive_loss = 0.0
+
+        sigreg_value = reconstruction_loss.new_zeros(())
+        sigreg_coeff_current = reconstruction_loss.new_zeros(())
+        if use_sigreg:
+            if final_h_pre is None:
+                raise RuntimeError("SIGReg is enabled but final_h_pre was not returned by the model")
+            seq_length = input_ids.shape[1]
+            h_pre_predicted = final_h_pre[:, seq_length:, :].reshape(-1, final_h_pre.shape[-1])
+            sigreg_value = compute_sigreg_ddp(
+                h_pre_predicted,
+                num_slices=getattr(self.hparams, 'sigreg_num_slices', 1024),
+                num_points=getattr(self.hparams, 'sigreg_num_points', 17),
+            )
+            sigreg_warmup_steps = getattr(self.hparams, 'sigreg_warmup_steps', 500)
+            if sigreg_warmup_steps > 0:
+                warmup_frac = min(float(getattr(self, 'global_step', 0)) / float(sigreg_warmup_steps), 1.0)
+                sigreg_coeff_current = reconstruction_loss.new_tensor(sigreg_lambda * warmup_frac)
+            else:
+                sigreg_coeff_current = reconstruction_loss.new_tensor(sigreg_lambda)
+            total_loss = total_loss + sigreg_coeff_current * sigreg_value
         
         if token_bytes is not None:
             # Compute per-token loss (reduction='none') for accurate BPB.
@@ -310,11 +357,23 @@ class EBT_NLP(LightningModule):
             bpb_nats = 0
             bpb_bytes = 0
 
+        transformer_for_logging = getattr(self, 'transformer_eager', self.transformer)
+        final_layer = getattr(transformer_for_logging, 'final_layer', None)
+        if final_layer is not None and hasattr(final_layer, 'weight'):
+            final_layer_weight_norm = final_layer.weight.detach().float().norm()
+        else:
+            final_layer_weight_norm = reconstruction_loss.new_zeros(()).detach()
+
         log_dict = {
             'loss': total_loss,
             'initial_loss' : initial_loss,
             'final_step_loss': final_reconstruction_loss,
             'contrastive_loss' : contrastive_loss,
+            'sigreg': sigreg_value.detach(),
+            'sigreg_coeff_current': sigreg_coeff_current.detach(),
+            'energy_std': predicted_energies[-1].detach().float().std(unbiased=False),
+            'final_layer_weight_norm': final_layer_weight_norm,
+            'alpha': self.alpha.detach().float(),
             'initial_final_pred_energies_gap': initial_final_pred_energies_gap,
             'perplexity': ppl_loss,
             'bpb': bpb_loss,

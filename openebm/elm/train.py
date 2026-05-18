@@ -504,6 +504,14 @@ if __name__ == '__main__':
 
     parser.add_argument("--no_mcmc_detach", help="dont detach between mcmc steps, probably need to use for S2 models but can increase instability due to longer gradient computation graphs", action="store_true", default=False)
 
+    parser.add_argument("--sigreg_lambda", help="[SIGReg] coefficient for pre-norm hidden isotropic Gaussian regularization", type=float, default=0.0)
+
+    parser.add_argument("--sigreg_num_slices", help="[SIGReg] number of random projection directions", type=int, default=1024)
+
+    parser.add_argument("--sigreg_num_points", help="[SIGReg] number of characteristic-function sample points per projection", type=int, default=17)
+
+    parser.add_argument("--sigreg_warmup_steps", help="[SIGReg] linearly warm up coefficient for this many optimizer steps; <=0 disables warmup", type=int, default=500)
+
     parser.add_argument("--contrastive_loss", help="uses a contrastive loss to shape the landscape of EBM, idea from IRED paper https://arxiv.org/abs/2406.11179", action="store_true", default=False)
 
     parser.add_argument("--contrastive_loss_coeff", help="coefficient for contrastive loss, didnt work well not used", type=float, default=0.0005)

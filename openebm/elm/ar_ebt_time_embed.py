@@ -810,6 +810,7 @@ class EBTTimeConcat(nn.Module):
         mcmc_step=0,
         real_token_ids: Optional[torch.Tensor] = None,
         predicted_tokens: Optional[torch.Tensor] = None,
+        return_h_pre: bool = False,
     ):
         """
         Perform a forward pass through the Transformer model.
@@ -881,10 +882,14 @@ class EBTTimeConcat(nn.Module):
                         extra_prefix_tokens=extra_prefix_tokens,
                     )
                 embeddings = layer(embeddings, start_pos, freqs_cis, mask, ve=ve)
+            h_pre = embeddings
             embeddings = self.norm(embeddings)
             if self.use_mcmc_time_embed:
+                h_pre = h_pre[:, 1:] # remove temporal embed
                 embeddings = embeddings[:, 1:] # remove temporal embed
             energies = self.final_layer(embeddings)
 
             energies = energies[:, embeddings.shape[1] // 2:]
+            if return_h_pre:
+                return energies, h_pre
             return energies
