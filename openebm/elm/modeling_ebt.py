@@ -245,7 +245,7 @@ class EBT_NLP(LightningModule):
             return predicted_distributions, predicted_energies, final_h_pre
         return predicted_distributions, predicted_energies
 
-    def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
+    def forward_loss_wrapper(self, x, phase="train", token_bytes=None, global_step=None):
         no_randomness = False if phase == "train" else True
         sigreg_lambda = getattr(self.hparams, 'sigreg_lambda', 0.0)
         use_sigreg = sigreg_lambda > 0.0
@@ -334,11 +334,13 @@ class EBT_NLP(LightningModule):
             )
             sigreg_warmup_steps = getattr(self.hparams, 'sigreg_warmup_steps', 500)
             if sigreg_warmup_steps > 0:
-                warmup_frac = min(float(getattr(self, 'global_step', 0)) / float(sigreg_warmup_steps), 1.0)
+                current_global_step = self.global_step if global_step is None else global_step
+                warmup_frac = min(float(current_global_step) / float(sigreg_warmup_steps), 1.0)
                 sigreg_coeff_current = reconstruction_loss.new_tensor(sigreg_lambda * warmup_frac)
             else:
                 sigreg_coeff_current = reconstruction_loss.new_tensor(sigreg_lambda)
-            total_loss = total_loss + sigreg_coeff_current * sigreg_value
+            if phase == "train":
+                total_loss = total_loss + sigreg_coeff_current * sigreg_value
         
         if token_bytes is not None:
             # Compute per-token loss (reduction='none') for accurate BPB.
