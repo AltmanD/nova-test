@@ -162,9 +162,10 @@ def main(args):
         num_gpus = int(args.gpus)
     print("devices/args.gpus: ", args.gpus)
 
-    # NOTE: num_workers is NOT configurable — nanochat DataLoader hardcodes num_workers=0
-    # because the generator holds GPU state (pre-allocated CUDA buffers) that cannot be
-    # pickled into worker processes. See dataset.py generate_dataloader() for details.
+    # NOTE: num_workers is NOT configurable — nanochat pretrain DataLoader hardcodes
+    # num_workers=0. The IterableDataset owns mutable exact-resume state
+    # (parquet cursor + doc_buffer) and materializes CUDA tensors inside __iter__(),
+    # so worker processes would duplicate iterator state and break resume semantics.
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     assert (device == torch.device('cuda') and num_gpus > 0), "using cpu instead of cuda. if you would like to proceed please remove this line and change code below to not use GPUs, otherwise check packages to ensure torch/others have cuda support"
@@ -334,6 +335,7 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
         max_steps=args.max_steps,
         logger=wandb_logger,
         enable_model_summary=args.log_model_archi,
+        enable_progress_bar=not getattr(args, "profile_training_pipeline", False),
         callbacks=callbacks,
         strategy = args.distributed_strategy, 
         enable_checkpointing=True,
@@ -705,10 +707,10 @@ if __name__ == '__main__':
     #DATASET AND DATALOADER #########################################################
 
     # NOTE: --num_workers and --prefetch_factor have been removed.
-    # The nanochat DataLoader hardcodes num_workers=0 because its generator holds
-    # GPU state (pre-allocated CUDA buffers) that cannot be pickled into worker
-    # processes. pin_memory=False because data is already on GPU.
-    # See dataset.py generate_dataloader() for details.
+    # The nanochat pretrain DataLoader hardcodes num_workers=0 because it is a
+    # stateful IterableDataset with exact-resume cursor/doc_buffer ownership and
+    # it also copies CUDA tensors inside __iter__(). pin_memory=False because
+    # yielded pretrain batches are already on GPU.
     
     parser.add_argument("--dataset_name", help="dataset name", default="ucf101")
     
@@ -917,6 +919,8 @@ if __name__ == '__main__':
     parser.add_argument("--debug_unused_parameters", help="makes it so it tracks which params are used to find the params that are causing the unused params issue. need to do some things in base_model_trainer so ctrl f this hparam to see the NOTEs", action="store_true", default=False)
 
     parser.add_argument("--manual_gc_collect_every_n_steps", help="manually call gc collect every n steps, can be done to prevent CPU RAM memory 'leak'", type = int, default=-1)
+
+    parser.add_argument("--profile_training_pipeline", help="profile dataloader wait, packing, tokenization, forward/backward, and optimizer step timings during training", action="store_true", default=False)
 
     parser.add_argument("--debug_videos", help="debug generated videos in a grid", action="store_true", default=False)
 

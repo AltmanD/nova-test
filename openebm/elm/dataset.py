@@ -23,6 +23,7 @@ class IterableDataset(_IterableDataset):
         max_iter,
         device="cuda",
         resume_state_dict=None,
+        enable_profiling=False,
     ):
         super().__init__()
 
@@ -33,6 +34,7 @@ class IterableDataset(_IterableDataset):
         self.max_iter = max_iter
         self.device = device
         self.resume_state_dict = resume_state_dict
+        self.enable_profiling = enable_profiling
         self.batch_idx = 0
         self.last_state_dict = None  # 最新的 dataloader 位置，用于 checkpoint 恢复
         self._stateful_loader = None  # holds StatefulBestFitDataLoader instance
@@ -45,6 +47,7 @@ class IterableDataset(_IterableDataset):
             split=self.split,
             device=self.device,
             resume_state_dict=self.resume_state_dict,
+            enable_profiling=self.enable_profiling,
         )
         for inputs, targets, state_dict in self._stateful_loader:
             self.last_state_dict = state_dict
@@ -56,11 +59,25 @@ class IterableDataset(_IterableDataset):
             return self._stateful_loader.state_dict()
         return self.last_state_dict  # fallback
 
+    def get_last_batch_profile(self):
+        if self._stateful_loader is not None and hasattr(self._stateful_loader, "get_last_batch_profile"):
+            return self._stateful_loader.get_last_batch_profile()
+        return None
+
     def __len__(self):
         return self.max_iter
 
 
-def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device, resume_state_dict=None):
+def generate_dataloader(
+    tokenizer,
+    batch_size,
+    max_len,
+    max_iter,
+    split,
+    device,
+    resume_state_dict=None,
+    enable_profiling=False,
+):
 
     dataset = IterableDataset(
         tokenizer=tokenizer,
@@ -70,6 +87,7 @@ def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device,
         max_iter=max_iter,
         device=device,
         resume_state_dict=resume_state_dict,
+        enable_profiling=enable_profiling,
     )
 
     dataloader = DataLoader(

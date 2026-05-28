@@ -16,6 +16,7 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
+import time
 import torch
 import pyarrow.parquet as pq
 
@@ -24,6 +25,23 @@ from nanochat.dataset import list_parquet_files
 
 # Version tag for exact-resume state dicts (distinguishes from legacy checkpoints)
 EXACT_RESUME_STATE_VERSION = 1
+
+
+def _profile_mean(values):
+    return sum(values) / len(values) if values else float("nan")
+
+
+def _profile_percentile(values, quantile):
+    if not values:
+        return float("nan")
+    sorted_values = sorted(values)
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    pos = (len(sorted_values) - 1) * quantile
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    weight = pos - lo
+    return float(sorted_values[lo] * (1.0 - weight) + sorted_values[hi] * weight)
 
 
 class StatefulBestFitDataLoader:
@@ -40,6 +58,7 @@ class StatefulBestFitDataLoader:
         self, tokenizer, B, T, split, device="cuda",
         resume_state_dict=None, buffer_size=1000,
         tokenizer_threads=4, tokenizer_batch_size=128,
+        enable_profiling=False,
     ):
         self.tokenizer = tokenizer
         self.B = B
@@ -49,6 +68,7 @@ class StatefulBestFitDataLoader:
         self.buffer_size = buffer_size
         self.tokenizer_threads = tokenizer_threads
         self.tokenizer_batch_size = tokenizer_batch_size
+        self.enable_profiling = enable_profiling
 
         self.bos_token = tokenizer.get_bos_token_id()
         self.row_capacity = T + 1
@@ -73,6 +93,7 @@ class StatefulBestFitDataLoader:
         self.next_epoch = 1
         self.next_doc_batch_index = 0  # sub-batch index within current row group
         self.doc_buffer = []           # tokenized docs not yet consumed by packing
+        self.last_batch_profile = None
 
         # Apply resume state
         self._resume_state = resume_state_dict
@@ -94,6 +115,16 @@ class StatefulBestFitDataLoader:
             "epoch": self.next_epoch,
             "doc_batch_index": self.next_doc_batch_index,
             "doc_buffer": [list(doc) for doc in self.doc_buffer],  # deep copy
+        }
+
+    def lightweight_state_dict(self):
+        """Export streaming position without copying doc_buffer."""
+        return {
+            "state_version": EXACT_RESUME_STATE_VERSION,
+            "pq_idx": self.next_pq_idx,
+            "rg_idx": self.next_rg_idx,
+            "epoch": self.next_epoch,
+            "doc_batch_index": self.next_doc_batch_index,
         }
 
     def _apply_resume_state(self, state):
@@ -119,6 +150,9 @@ class StatefulBestFitDataLoader:
             self._legacy_rg_idx = state.get("rg_idx", None)
             print(f"[Legacy Resume] rank={self._ddp_rank}: pq_idx={self.next_pq_idx}, "
                   f"rg_idx(legacy)={self._legacy_rg_idx}, epoch={self.next_epoch}")
+
+    def get_last_batch_profile(self):
+        return self.last_batch_profile
 
     # ------------------------------------------------------------------
     # Document iteration (replaces _document_batches generator)
@@ -212,14 +246,20 @@ class StatefulBestFitDataLoader:
 
         # Start document iterator
         doc_iter = self._doc_batch_iter()
+        profile_enabled = self.enable_profiling
 
         def refill_buffer():
+            fetch_t0 = time.perf_counter() if profile_enabled else 0.0
             text_batch, _, _, _ = next(doc_iter)
+            fetch_s = time.perf_counter() - fetch_t0 if profile_enabled else 0.0
+            tokenize_t0 = time.perf_counter() if profile_enabled else 0.0
             token_lists = self.tokenizer.encode(
                 text_batch, prepend=self.bos_token, num_threads=self.tokenizer_threads
             )
+            tokenize_s = time.perf_counter() - tokenize_t0 if profile_enabled else 0.0
             for tokens in token_lists:
                 doc_buffer.append(tokens)
+            return fetch_s, tokenize_s
 
         # Pre-allocate buffers
         use_cuda = self.device == "cuda"
@@ -232,40 +272,171 @@ class StatefulBestFitDataLoader:
         targets = gpu_buffer[B * T:].view(B, T)
 
         while True:
+            batch_t0 = time.perf_counter() if profile_enabled else 0.0
+            refill_fetch_s = 0.0
+            tokenize_s = 0.0
+            packing_scan_s = 0.0
+            cpu_to_gpu_copy_s = 0.0
+            doc_select_s = 0.0
+            crop_branch_s = 0.0
+            tensor_materialize_s = 0.0
+            row_buffer_write_s = 0.0
+            cpu_batch_copy_s = 0.0
+            state_dict_s = 0.0
+            refill_calls = 0
+            packed_docs = 0
+            cropped_docs = 0
+            packed_tokens = 0
+            cropped_tokens = 0
+            selected_docs = 0
+            doc_lengths = [] if profile_enabled else None
+            crop_remaining_lengths = [] if profile_enabled else None
+            doc_buffer_len_start = len(doc_buffer)
+            max_doc_buffer_len = len(doc_buffer)
+
             for row_idx in range(B):
                 pos = 0
                 while pos < row_capacity:
                     while len(doc_buffer) < buffer_size:
-                        refill_buffer()
+                        fetch_s, tok_s = refill_buffer()
+                        if profile_enabled:
+                            refill_calls += 1
+                            refill_fetch_s += fetch_s
+                            tokenize_s += tok_s
+                            max_doc_buffer_len = max(max_doc_buffer_len, len(doc_buffer))
 
                     remaining = row_capacity - pos
 
                     # Find largest doc that fits entirely
                     best_idx = -1
                     best_len = 0
+                    scan_t0 = time.perf_counter() if profile_enabled else 0.0
                     for i, doc in enumerate(doc_buffer):
                         doc_len = len(doc)
                         if doc_len <= remaining and doc_len > best_len:
                             best_idx = i
                             best_len = doc_len
+                    if profile_enabled:
+                        packing_scan_s += time.perf_counter() - scan_t0
 
                     if best_idx >= 0:
+                        select_t0 = time.perf_counter() if profile_enabled else 0.0
                         doc = doc_buffer.pop(best_idx)
                         doc_len = len(doc)
-                        row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
+                        if profile_enabled:
+                            doc_select_s += time.perf_counter() - select_t0
+                            selected_docs += 1
+                            doc_lengths.append(doc_len)
+
+                        tensor_t0 = time.perf_counter() if profile_enabled else 0.0
+                        doc_tensor = torch.tensor(doc, dtype=torch.long)
+                        if profile_enabled:
+                            tensor_materialize_s += time.perf_counter() - tensor_t0
+
+                        write_t0 = time.perf_counter() if profile_enabled else 0.0
+                        row_buffer[row_idx, pos:pos + doc_len] = doc_tensor
+                        if profile_enabled:
+                            row_buffer_write_s += time.perf_counter() - write_t0
+
                         pos += doc_len
+                        if profile_enabled:
+                            packed_docs += 1
+                            packed_tokens += doc_len
                     else:
+                        crop_t0 = time.perf_counter() if profile_enabled else 0.0
+                        select_t0 = time.perf_counter() if profile_enabled else 0.0
                         shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
                         doc = doc_buffer.pop(shortest_idx)
-                        row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                        pos += remaining
+                        doc_len = len(doc)
+                        if profile_enabled:
+                            doc_select_s += time.perf_counter() - select_t0
+                            selected_docs += 1
+                            doc_lengths.append(doc_len)
+                            crop_remaining_lengths.append(remaining)
 
+                        tensor_t0 = time.perf_counter() if profile_enabled else 0.0
+                        doc_tensor = torch.tensor(doc[:remaining], dtype=torch.long)
+                        if profile_enabled:
+                            tensor_materialize_s += time.perf_counter() - tensor_t0
+
+                        write_t0 = time.perf_counter() if profile_enabled else 0.0
+                        row_buffer[row_idx, pos:pos + remaining] = doc_tensor
+                        if profile_enabled:
+                            row_buffer_write_s += time.perf_counter() - write_t0
+
+                        pos += remaining
+                        if profile_enabled:
+                            cropped_docs += 1
+                            cropped_tokens += remaining
+                            crop_branch_s += time.perf_counter() - crop_t0
+
+            cpu_copy_t0 = time.perf_counter() if profile_enabled else 0.0
             cpu_inputs.copy_(row_buffer[:, :-1])
             cpu_targets.copy_(row_buffer[:, 1:])
+            if profile_enabled:
+                cpu_batch_copy_s = time.perf_counter() - cpu_copy_t0
 
-            sd = self.state_dict()
+            state_t0 = time.perf_counter() if profile_enabled else 0.0
+            sd = self.lightweight_state_dict()
+            state_dict_s = time.perf_counter() - state_t0 if profile_enabled else 0.0
 
+            copy_t0 = time.perf_counter() if profile_enabled else 0.0
             gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+            cpu_to_gpu_copy_s = time.perf_counter() - copy_t0 if profile_enabled else 0.0
+
+            if profile_enabled:
+                total_output_tokens = packed_tokens + cropped_tokens
+                batch_total_ms = (time.perf_counter() - batch_t0) * 1000.0
+                non_overlapping_accounted_ms = (
+                    refill_fetch_s
+                    + tokenize_s
+                    + packing_scan_s
+                    + doc_select_s
+                    + tensor_materialize_s
+                    + row_buffer_write_s
+                    + cpu_batch_copy_s
+                    + state_dict_s
+                    + cpu_to_gpu_copy_s
+                ) * 1000.0
+                self.last_batch_profile = {
+                    "split": self.split,
+                    "rank": self._ddp_rank,
+                    "pq_idx": sd["pq_idx"],
+                    "rg_idx": sd["rg_idx"],
+                    "epoch": sd["epoch"],
+                    "doc_batch_index": sd["doc_batch_index"],
+                    "doc_buffer_len_start": doc_buffer_len_start,
+                    "doc_buffer_len_end": len(doc_buffer),
+                    "doc_buffer_len_max": max_doc_buffer_len,
+                    "refill_calls": refill_calls,
+                    "refill_fetch_ms": refill_fetch_s * 1000.0,
+                    "tokenize_ms": tokenize_s * 1000.0,
+                    "packing_scan_ms": packing_scan_s * 1000.0,
+                    "doc_select_ms": doc_select_s * 1000.0,
+                    "crop_branch_ms": crop_branch_s * 1000.0,
+                    "tensor_materialize_ms": tensor_materialize_s * 1000.0,
+                    "row_buffer_write_ms": row_buffer_write_s * 1000.0,
+                    "cpu_batch_copy_ms": cpu_batch_copy_s * 1000.0,
+                    "state_dict_ms": state_dict_s * 1000.0,
+                    "cpu_to_gpu_copy_ms": cpu_to_gpu_copy_s * 1000.0,
+                    "h2d_copy_ms": cpu_to_gpu_copy_s * 1000.0,
+                    "unaccounted_ms": max(0.0, batch_total_ms - non_overlapping_accounted_ms),
+                    "selected_docs": selected_docs,
+                    "packed_docs": packed_docs,
+                    "cropped_docs": cropped_docs,
+                    "packed_tokens": packed_tokens,
+                    "cropped_tokens": cropped_tokens,
+                    "crop_ratio": cropped_tokens / total_output_tokens if total_output_tokens else float("nan"),
+                    "doc_len_mean": _profile_mean(doc_lengths),
+                    "doc_len_p50": _profile_percentile(doc_lengths, 0.50),
+                    "doc_len_p90": _profile_percentile(doc_lengths, 0.90),
+                    "doc_len_p99": _profile_percentile(doc_lengths, 0.99),
+                    "doc_len_max": max(doc_lengths) if doc_lengths else float("nan"),
+                    "remaining_tokens_mean": _profile_mean(crop_remaining_lengths),
+                    "remaining_tokens_min": min(crop_remaining_lengths) if crop_remaining_lengths else float("nan"),
+                    "remaining_tokens_max": max(crop_remaining_lengths) if crop_remaining_lengths else float("nan"),
+                    "batch_total_ms": batch_total_ms,
+                }
             yield inputs, targets, sd
 
 
@@ -277,7 +448,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000, enable_profiling=False,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -288,6 +459,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         tokenizer=tokenizer, B=B, T=T, split=split, device=device,
         resume_state_dict=resume_state_dict, buffer_size=buffer_size,
         tokenizer_threads=tokenizer_threads, tokenizer_batch_size=tokenizer_batch_size,
+        enable_profiling=enable_profiling,
     )
     yield from loader
 

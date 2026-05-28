@@ -127,7 +127,18 @@ class ModelTrainer(LightningModule):
 
         # Training throughput tracking
         self._train_step_start_time = None
+        self._train_step_perf_start = None
         self._train_start_time = None  # wall-clock start for ETA
+        self._batch_fetch_end_time = None
+        self._last_data_wait_s = 0.0
+        self._last_forward_s = 0.0
+        self._last_backward_s = 0.0
+        self._last_optimizer_step_s = 0.0
+        self._optimizer_step_t0 = None
+        self._last_dataloader_profile = None
+        self._last_train_loss = None
+        self._profile_window = None
+        self._profile_header_printed = False
 
         # Dataloader resume state: 用于从 checkpoint 恢复 dataloader 位置
         self._dataloader_resume_state = None
@@ -371,6 +382,222 @@ class ModelTrainer(LightningModule):
         def hook(grad):
             self.model.used_parameters.add(name)  # Adjusted to self.model.used_parameters
         return hook
+
+    def _reset_profile_window(self):
+        dl_sum_keys = (
+            "batch_total_ms",
+            "refill_fetch_ms",
+            "tokenize_ms",
+            "packing_scan_ms",
+            "doc_select_ms",
+            "crop_branch_ms",
+            "tensor_materialize_ms",
+            "row_buffer_write_ms",
+            "cpu_batch_copy_ms",
+            "state_dict_ms",
+            "cpu_to_gpu_copy_ms",
+            "h2d_copy_ms",
+            "unaccounted_ms",
+            "doc_buffer_len_start",
+            "packed_docs",
+            "cropped_docs",
+            "selected_docs",
+            "packed_tokens",
+            "cropped_tokens",
+            "crop_ratio",
+            "doc_len_mean",
+            "doc_len_p50",
+            "doc_len_p90",
+            "doc_len_p99",
+            "remaining_tokens_mean",
+            "refill_calls",
+        )
+        dl_max_keys = (
+            "batch_total_ms",
+            "tokenize_ms",
+            "packing_scan_ms",
+            "doc_select_ms",
+            "crop_branch_ms",
+            "tensor_materialize_ms",
+            "row_buffer_write_ms",
+            "cpu_batch_copy_ms",
+            "state_dict_ms",
+            "cpu_to_gpu_copy_ms",
+            "h2d_copy_ms",
+            "unaccounted_ms",
+            "doc_buffer_len_max",
+            "doc_len_max",
+            "remaining_tokens_max",
+        )
+        self._profile_window = {
+            "micro_count": 0,
+            "dt_s_sum": 0.0,
+            "data_wait_s_sum": 0.0,
+            "forward_s_sum": 0.0,
+            "backward_s_sum": 0.0,
+            "optimizer_s_sum": 0.0,
+            "data_wait_s_max": 0.0,
+            "dl_sums": {key: 0.0 for key in dl_sum_keys},
+            "dl_counts": {key: 0 for key in dl_sum_keys},
+            "dl_maxes": {key: 0.0 for key in dl_max_keys},
+            "dl_mins": {"remaining_tokens_min": float("inf")},
+            "dl_last": {},
+        }
+
+    def _update_profile_window(self):
+        if self._profile_window is None:
+            self._reset_profile_window()
+
+        window = self._profile_window
+        window["micro_count"] += 1
+        window["dt_s_sum"] += float(getattr(self, "_last_dt", 0.0) or 0.0)
+        window["data_wait_s_sum"] += self._last_data_wait_s
+        window["forward_s_sum"] += self._last_forward_s
+        window["backward_s_sum"] += self._last_backward_s
+        window["optimizer_s_sum"] += self._last_optimizer_step_s
+        window["data_wait_s_max"] = max(window["data_wait_s_max"], self._last_data_wait_s)
+
+        dl = self._last_dataloader_profile or {}
+        if dl:
+            def finite_number(value):
+                return isinstance(value, (int, float)) and value == value
+
+            for key in window["dl_sums"].keys():
+                value = dl.get(key)
+                if finite_number(value):
+                    window["dl_sums"][key] += float(value)
+                    window["dl_counts"][key] += 1
+            for key in window["dl_maxes"].keys():
+                value = dl.get(key)
+                if finite_number(value):
+                    window["dl_maxes"][key] = max(window["dl_maxes"][key], float(value))
+            for key in window["dl_mins"].keys():
+                value = dl.get(key)
+                if finite_number(value):
+                    window["dl_mins"][key] = min(window["dl_mins"][key], float(value))
+            window["dl_last"] = dl
+
+    def _emit_profile_step_summary(self):
+        if self._profile_window is None:
+            return
+        window = self._profile_window
+        micro_count = max(1, int(window["micro_count"]))
+        step_wall_s = max(window["dt_s_sum"], 1e-9)
+        num_gpus = getattr(self.hparams, 'num_gpus', 1)
+        tokens_per_optimizer_step = (
+            num_gpus
+            * self.hparams.batch_size_per_device
+            * self.hparams.context_length
+            * self.hparams.accumulate_grad_batches
+        )
+        tok_per_sec = tokens_per_optimizer_step / step_wall_s
+        step_ms = step_wall_s * 1000.0
+        wait_avg_ms = window["data_wait_s_sum"] * 1000.0 / micro_count
+        fw_avg_ms = window["forward_s_sum"] * 1000.0 / micro_count
+        bw_avg_ms = window["backward_s_sum"] * 1000.0 / micro_count
+        opt_ms = window["optimizer_s_sum"] * 1000.0
+
+        dl_sums = window["dl_sums"]
+        dl_last = window["dl_last"]
+
+        def avg_profile(key):
+            count = int(window["dl_counts"].get(key, 0))
+            return dl_sums.get(key, 0.0) / count if count > 0 else float("nan")
+
+        def sum_profile(key):
+            return dl_sums.get(key, 0.0)
+
+        def max_profile(key):
+            return window["dl_maxes"].get(key, float("nan"))
+
+        def min_profile(key):
+            value = window["dl_mins"].get(key, float("nan"))
+            return value if value != float("inf") else float("nan")
+
+        def as_int(value, default=-1):
+            if not isinstance(value, (int, float)) or value != value or value == float("inf"):
+                return default
+            return int(value)
+
+        loss_val = self._last_train_loss if self._last_train_loss is not None else float("nan")
+        current_step = self.global_step
+        max_steps = self.hparams.max_steps
+        progress_pct = 100.0 * current_step / max_steps if max_steps > 0 else 0.0
+        packed_tokens = sum_profile("packed_tokens")
+        cropped_tokens = sum_profile("cropped_tokens")
+        total_tokens = packed_tokens + cropped_tokens
+        crop_ratio = cropped_tokens / total_tokens if total_tokens > 0 else float("nan")
+
+        print(
+            f"[profile_step] step={current_step:05d}/{max_steps} "
+            f"progress={progress_pct:6.2f}% "
+            f"loss={loss_val:.6f} "
+            f"tok_s={tok_per_sec:,.0f} "
+            f"step_ms={step_ms:.2f} "
+            f"mb={micro_count}",
+            flush=True,
+        )
+        print(
+            f"[profile_timing] step={current_step:05d} "
+            f"wait_avg_ms={wait_avg_ms:.2f} "
+            f"wait_max_ms={window['data_wait_s_max'] * 1000.0:.2f} "
+            f"fw_avg_ms={fw_avg_ms:.2f} "
+            f"bw_avg_ms={bw_avg_ms:.2f} "
+            f"opt_ms={opt_ms:.2f}",
+            flush=True,
+        )
+        print(
+            f"[profile_data] step={current_step:05d} "
+            f"dl_avg_ms={avg_profile('batch_total_ms'):.2f} "
+            f"dl_max_ms={max_profile('batch_total_ms'):.2f} "
+            f"fetch_avg_ms={avg_profile('refill_fetch_ms'):.2f} "
+            f"tok_avg_ms={avg_profile('tokenize_ms'):.2f} "
+            f"tok_max_ms={max_profile('tokenize_ms'):.2f} "
+            f"pack_avg_ms={avg_profile('packing_scan_ms'):.2f} "
+            f"pack_max_ms={max_profile('packing_scan_ms'):.2f} "
+            f"doc_select_avg_ms={avg_profile('doc_select_ms'):.2f} "
+            f"doc_select_max_ms={max_profile('doc_select_ms'):.2f} "
+            f"crop_branch_avg_ms={avg_profile('crop_branch_ms'):.2f} "
+            f"crop_branch_max_ms={max_profile('crop_branch_ms'):.2f} "
+            f"tensor_avg_ms={avg_profile('tensor_materialize_ms'):.2f} "
+            f"tensor_max_ms={max_profile('tensor_materialize_ms'):.2f} "
+            f"row_write_avg_ms={avg_profile('row_buffer_write_ms'):.2f} "
+            f"row_write_max_ms={max_profile('row_buffer_write_ms'):.2f} "
+            f"cpu_batch_copy_avg_ms={avg_profile('cpu_batch_copy_ms'):.2f} "
+            f"cpu_batch_copy_max_ms={max_profile('cpu_batch_copy_ms'):.2f} "
+            f"state_dict_avg_ms={avg_profile('state_dict_ms'):.2f} "
+            f"state_dict_max_ms={max_profile('state_dict_ms'):.2f} "
+            f"unaccounted_avg_ms={avg_profile('unaccounted_ms'):.2f} "
+            f"unaccounted_max_ms={max_profile('unaccounted_ms'):.2f} "
+            f"copy_avg_ms={avg_profile('cpu_to_gpu_copy_ms'):.2f} "
+            f"h2d_copy_avg_ms={avg_profile('h2d_copy_ms'):.2f}",
+            flush=True,
+        )
+        print(
+            f"[profile_state] step={current_step:05d} "
+            f"pq={int(dl_last.get('pq_idx', -1))} "
+            f"rg={int(dl_last.get('rg_idx', -1))} "
+            f"doc_batch={int(dl_last.get('doc_batch_index', -1))} "
+            f"docbuf_start_avg={avg_profile('doc_buffer_len_start'):.2f} "
+            f"docbuf_end={int(dl_last.get('doc_buffer_len_end', -1))} "
+            f"docbuf_max={as_int(max_profile('doc_buffer_len_max'))} "
+            f"refill_calls={as_int(sum_profile('refill_calls'), 0)} "
+            f"selected_docs={as_int(sum_profile('selected_docs'), 0)} "
+            f"packed_docs={as_int(sum_profile('packed_docs'), 0)} "
+            f"cropped_docs={as_int(sum_profile('cropped_docs'), 0)} "
+            f"packed_tok={as_int(packed_tokens, 0)} "
+            f"cropped_tok={as_int(cropped_tokens, 0)} "
+            f"crop_ratio={crop_ratio:.4f} "
+            f"doc_len_mean={avg_profile('doc_len_mean'):.2f} "
+            f"doc_len_p50={avg_profile('doc_len_p50'):.2f} "
+            f"doc_len_p90={avg_profile('doc_len_p90'):.2f} "
+            f"doc_len_p99={avg_profile('doc_len_p99'):.2f} "
+            f"doc_len_max={max_profile('doc_len_max'):.2f} "
+            f"remaining_mean={avg_profile('remaining_tokens_mean'):.2f} "
+            f"remaining_min={min_profile('remaining_tokens_min'):.2f} "
+            f"remaining_max={max_profile('remaining_tokens_max'):.2f}",
+            flush=True,
+        )
     
     @staticmethod
     def wandb_activation_hook(run, step):
@@ -398,6 +625,14 @@ class ModelTrainer(LightningModule):
         return hook
     
     def training_step(self, batch, batch_idx):
+        import time as _time
+
+        step_start = _time.perf_counter()
+        if self._batch_fetch_end_time is not None:
+            self._last_data_wait_s = max(0.0, step_start - self._batch_fetch_end_time)
+        else:
+            self._last_data_wait_s = 0.0
+
         # Activation logging only when wandb_watch is on AND level is "all"
         if not self.hparams.no_wandb and self.hparams.wandb_watch and getattr(self.hparams, 'wandb_watch_level', 'parameters') == 'all' and self.global_step % self.hparams.wandb_watch_log_freq == 0: # activation logging
             hook_handles = []
@@ -413,11 +648,22 @@ class ModelTrainer(LightningModule):
 
         else:
             eval_step_dict = self.eval_step(batch, "train")
-        
+
+        self._last_forward_s = _time.perf_counter() - step_start
+        loss_val = eval_step_dict.get('loss', None)
+        if isinstance(loss_val, torch.Tensor):
+            self._last_train_loss = loss_val.detach().item()
+        elif loss_val is not None:
+            self._last_train_loss = float(loss_val)
         self.log_metrics(eval_step_dict, "train")
         return eval_step_dict['loss']   
     
     def on_after_backward(self):
+        import time as _time
+        if self._train_step_perf_start is not None:
+            elapsed = _time.perf_counter() - self._train_step_perf_start
+            self._last_backward_s = max(0.0, elapsed - self._last_forward_s)
+
         if self.hparams.log_gradients:
             total_norm = 0.0
             num_parameters = 0
@@ -440,6 +686,26 @@ class ModelTrainer(LightningModule):
             things_to_log['avg_gradient_norms'] = average_norm
             things_to_log['pct_gradient_clipped'] = percentage_clipped
             self.log_metrics(things_to_log, "train", log_torchmetrics = False)
+
+    def on_train_batch_start(self, batch, batch_idx):
+        import time as _time
+        self._train_step_perf_start = _time.perf_counter()
+        self._last_forward_s = 0.0
+        self._last_backward_s = 0.0
+        self._last_optimizer_step_s = 0.0
+        self._last_dataloader_profile = None
+        if self._profile_window is None:
+            self._reset_profile_window()
+
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure, *args, **kwargs):
+        import time as _time
+        self._optimizer_step_t0 = _time.perf_counter()
+        try:
+            return super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure, *args, **kwargs)
+        finally:
+            if self._optimizer_step_t0 is not None:
+                self._last_optimizer_step_s = _time.perf_counter() - self._optimizer_step_t0
+                self._optimizer_step_t0 = None
         
     def on_train_batch_end(self, outputs, batch, batch_idx):
         #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)
@@ -481,9 +747,23 @@ class ModelTrainer(LightningModule):
             self._last_dt = now - self._train_step_start_time
         else:
             self._last_dt = None
+        try:
+            train_dl = self.trainer.train_dataloader
+            dataset = getattr(train_dl, "dataset", None)
+            if dataset is not None and hasattr(dataset, "get_last_batch_profile"):
+                self._last_dataloader_profile = dataset.get_last_batch_profile()
+        except Exception:
+            self._last_dataloader_profile = None
         self._train_step_start_time = now
+        self._train_step_perf_start = None
+        self._batch_fetch_end_time = _time.perf_counter()
         if self._train_start_time is None:
             self._train_start_time = now
+        if getattr(self.hparams, "profile_training_pipeline", False):
+            self._update_profile_window()
+            if self.trainer.is_global_zero and self._last_optimizer_step_s > 0.0:
+                self._emit_profile_step_summary()
+                self._reset_profile_window()
 
     # def on_train_epoch_end(self): ## not effective for EBT
     #     if self.hparams.optimizer != "adamw": # e.g. for lars need to manually update epoch
@@ -1823,6 +2103,7 @@ class ModelTrainer(LightningModule):
                 split="train",
                 device=self.device,
                 resume_state_dict=resume_state,
+                enable_profiling=getattr(self.hparams, 'profile_training_pipeline', False),
             )
         return train_dataloader
 
@@ -1870,6 +2151,7 @@ class ModelTrainer(LightningModule):
                 split="val",
                 device=self.device,
                 resume_state_dict=None,
+                enable_profiling=False,
             )
 
         return val_dataloader
@@ -2036,6 +2318,61 @@ class ModelTrainer(LightningModule):
             self.log("Langevin_dynamics_noise", self.model.langevin_dynamics_noise_std.detach(),
                      on_step=True, on_epoch=False)
 
+        if phase == "train" and getattr(self.hparams, "profile_training_pipeline", False):
+            self.log("profile/data_wait_ms", self._last_data_wait_s * 1000.0,
+                     prog_bar=False, on_step=True, on_epoch=False)
+            self.log("profile/forward_ms", self._last_forward_s * 1000.0,
+                     prog_bar=False, on_step=True, on_epoch=False)
+            self.log("profile/backward_ms", self._last_backward_s * 1000.0,
+                     prog_bar=False, on_step=True, on_epoch=False)
+            self.log("profile/optimizer_step_ms", self._last_optimizer_step_s * 1000.0,
+                     prog_bar=False, on_step=True, on_epoch=False)
+            if self._last_dataloader_profile is not None:
+                dl = self._last_dataloader_profile
+                for key in (
+                    "batch_total_ms",
+                    "refill_fetch_ms",
+                    "tokenize_ms",
+                    "packing_scan_ms",
+                    "doc_select_ms",
+                    "crop_branch_ms",
+                    "tensor_materialize_ms",
+                    "row_buffer_write_ms",
+                    "cpu_batch_copy_ms",
+                    "state_dict_ms",
+                    "unaccounted_ms",
+                    "cpu_to_gpu_copy_ms",
+                    "h2d_copy_ms",
+                ):
+                    if key in dl:
+                        self.log(f"profile/{key}", dl[key],
+                                 prog_bar=False, on_step=True, on_epoch=False)
+                for key in (
+                    "doc_buffer_len_start",
+                    "doc_buffer_len_end",
+                    "doc_buffer_len_max",
+                    "selected_docs",
+                    "packed_docs",
+                    "cropped_docs",
+                    "packed_tokens",
+                    "cropped_tokens",
+                    "crop_ratio",
+                    "doc_len_mean",
+                    "doc_len_p50",
+                    "doc_len_p90",
+                    "doc_len_p99",
+                    "doc_len_max",
+                    "remaining_tokens_mean",
+                    "remaining_tokens_min",
+                    "remaining_tokens_max",
+                    "pq_idx",
+                    "rg_idx",
+                    "doc_batch_index",
+                ):
+                    if key in dl:
+                        self.log(f"profile/{key}", float(dl[key]),
+                                 prog_bar=False, on_step=True, on_epoch=False)
+
         # 训练进度信息 (仅在训练阶段, 仅 rank 0 打印)
         if phase == "train" and hasattr(self, 'trainer') and self.trainer is not None:
             import time as _time
@@ -2073,13 +2410,12 @@ class ModelTrainer(LightningModule):
                     peak_lr = self.hparams.peak_learning_rate
                     lrm = cur_lr / peak_lr if peak_lr > 0 else 1.0
 
-                # --- tok/sec: tokens processed per second (全局) ---
-                # 每个 optimizer step 消耗 tokens = num_gpus × batch_per_device × context_length × grad_accum
+                # --- tok/sec: per-micro-batch view for the normal training log ---
+                # Profiling mode emits an optimizer-step aggregated tok/sec summary.
                 num_gpus = getattr(self.hparams, 'num_gpus', 1)
                 tokens_per_step = (num_gpus
                                    * self.hparams.batch_size_per_device
-                                   * self.hparams.context_length
-                                   * self.hparams.accumulate_grad_batches)
+                                   * self.hparams.context_length)
                 tok_per_sec = tokens_per_step / (dt_ms / 1000.0) if dt_ms > 0 else 0.0
 
                 # --- MFU (Model FLOP Utilization) ---
@@ -2154,17 +2490,26 @@ class ModelTrainer(LightningModule):
                 #     alpha_val = self.model.alpha.detach()
                 #     alpha_grad_str = f" grad={self.model.alpha.grad.item():.6f}" if self.model.alpha.grad is not None else " grad=None"
                 #     alpha_val_str = f" | alpha: {alpha_val.item():.6f} ({alpha_val.dtype}){alpha_grad_str}"
-                print(
-                    f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
-                    f"loss: {loss_val:.6f}"
-                    f"{valid_str} | "
-                    f"lrm: {lrm:.2f} | "
-                    f"dt: {dt_ms:.2f}ms | "
-                    f"tok/sec: {tok_per_sec:,.0f} | "
-                    f"mfu: {mfu:.2f} | "
-                    f"epoch: {epoch} | "
-                    f"total time: {total_min:.2f}m"
-                    f"{eta_str}",
-                    # f"{alpha_val_str}",
-                    flush=True,
-                )
+                if getattr(self.hparams, "profile_training_pipeline", False):
+                    if not self._profile_header_printed:
+                        print(
+                            "[profile] optimizer-step summaries enabled: "
+                            "profile_step/profile_timing/profile_data/profile_state",
+                            flush=True,
+                        )
+                        self._profile_header_printed = True
+                else:
+                    print(
+                        f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
+                        f"loss: {loss_val:.6f}"
+                        f"{valid_str} | "
+                        f"lrm: {lrm:.2f} | "
+                        f"dt: {dt_ms:.2f}ms | "
+                        f"tok/sec: {tok_per_sec:,.0f} | "
+                        f"mfu: {mfu:.2f} | "
+                        f"epoch: {epoch} | "
+                        f"total time: {total_min:.2f}m"
+                        f"{eta_str}",
+                        # f"{alpha_val_str}",
+                        flush=True,
+                    )
